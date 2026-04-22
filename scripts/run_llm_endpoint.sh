@@ -37,12 +37,24 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 LLM_ENDPOINT_HOST="${LLM_ENDPOINT_HOST:-${LABEL_MATCHER_HOST:-${VERIFIER_HOST:-127.0.0.1}}}"
 LLM_ENDPOINT_PORT="${LLM_ENDPOINT_PORT:-${LABEL_MATCHER_PORT:-${VERIFIER_PORT:-8081}}}"
 
-if [[ ! -d ".venv" ]]; then
-  "$PYTHON_BIN" -m venv .venv
-fi
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+if [[ "${1:-}" == "--foreground" ]]; then
+  if [[ ! -d ".venv" ]]; then
+    "$PYTHON_BIN" -m venv .venv
+  fi
+  source .venv/bin/activate
+  python -m pip install --upgrade pip
+  python -m pip install -r requirements.txt
 
-echo "Starting llm_endpoint on ${LLM_ENDPOINT_HOST}:${LLM_ENDPOINT_PORT}..."
-python -m uvicorn tools.llm_endpoint_service:app --host "$LLM_ENDPOINT_HOST" --port "$LLM_ENDPOINT_PORT"
+  echo "Starting llm_endpoint on ${LLM_ENDPOINT_HOST}:${LLM_ENDPOINT_PORT}..."
+  python -m uvicorn tools.llm_endpoint_service:app --host "$LLM_ENDPOINT_HOST" --port "$LLM_ENDPOINT_PORT"
+  exit 0
+fi
+
+echo "Starting llm_endpoint with PM2..."
+if pm2 describe perturb-llm-endpoint >/dev/null 2>&1; then
+  pm2 restart perturb-llm-endpoint
+else
+  pm2 start "./scripts/run_llm_endpoint.sh" --name perturb-llm-endpoint --interpreter bash -- --foreground
+fi
+pm2 save
+pm2 status perturb-llm-endpoint

@@ -17,8 +17,8 @@ Use this before long validator uptime tests or mainnet deployment.
 
 ## 3) Validator + Miner Launch
 
-- [ ] Miner starts with `./scripts/run_miner_node.sh`
-- [ ] Validator starts with `./scripts/run_validator_node.sh`
+- [ ] Miner starts with `bash ./scripts/run_miner.sh`
+- [ ] Validator starts with `bash ./scripts/run_validator.sh`
 - [ ] Validator logs challenge creation and miner selection each loop
 - [ ] Validator logs periodic `set_weights` attempts
 

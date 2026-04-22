@@ -57,22 +57,47 @@ This repository provides:
 ### Common software prerequisites
 
 - Python 3.10+
+- Node.js 18+ (includes `npm`) for PM2 installation
 - `pip` and virtualenv support (`python -m venv`)
 - OS build tools needed by Python wheels
 - For GPU usage: correct NVIDIA driver + CUDA stack compatible with installed PyTorch
+
+## Common Installation (Do Once)
+
+Run these once before role-specific setup:
+
+```bash
+git clone https://github.com/0xsigurd/Perturb
+cd Perturb
+npm install -g pm2
+```
+
+If `npm: command not found`, install Node.js first, then rerun PM2 install.
+
+macOS (Homebrew):
+
+```bash
+brew install node
+node --version
+npm --version
+npm install -g pm2
+```
+
+Ubuntu/Debian:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y nodejs npm
+node --version
+npm --version
+sudo npm install -g pm2
+```
 
 ## Installation and Setup (Validator Side)
 
 This section is specifically for validator operators.
 
-### 1) Clone and enter repository
-
-```bash
-git clone https://github.com/0xsigurd/Perturb
-cd Perturb
-```
-
-### 2) Configure and run local llm_endpoint
+### 1) Configure and run local llm_endpoint
 
 Create endpoint config:
 
@@ -90,7 +115,7 @@ Edit `scripts/llm_endpoint.env`:
 Start llm_endpoint:
 
 ```bash
-./scripts/run_llm_endpoint.sh
+bash ./scripts/run_llm_endpoint.sh
 ```
 
 Health check:
@@ -99,7 +124,7 @@ Health check:
 curl "http://127.0.0.1:8081/health"
 ```
 
-### 3) Configure validator runtime
+### 2) Configure validator runtime
 
 Create validator env:
 
@@ -125,10 +150,10 @@ Important validator-specific fields:
 - `PERTURB_MIN_LINF_DELTA`
 - `PERTURB_MAX_LINF_DELTA`
 
-### 4) Start validator
+### 3) Start validator stack (llm_endpoint + validator)
 
 ```bash
-./scripts/run_validator_node.sh
+bash ./scripts/run_llm_endpoint.sh && bash ./scripts/run_validator.sh
 ```
 
 Expected log behavior:
@@ -138,7 +163,7 @@ Expected log behavior:
 - per-miner score logs
 - periodic `set_weights` attempts
 
-### 5) Validator-side notes
+### 4) Validator-side notes
 
 - Verification is LLM-only by design; if llm_endpoint is down, challenge verification fails.
 - Keep fallback image `assets/dog_1.jpg` present for external image API outage handling.
@@ -147,14 +172,7 @@ Expected log behavior:
 
 This section is specifically for miner operators.
 
-### 1) Clone and enter repository
-
-```bash
-git clone https://github.com/0xsigurd/Perturb
-cd Perturb
-```
-
-### 2) Configure miner runtime
+### 1) Configure miner runtime
 
 Create miner env:
 
@@ -174,10 +192,10 @@ Optional:
 - `PYTHON_BIN`
 - `MINER_EXTRA_ARGS`
 
-### 3) Start miner
+### 2) Start miner
 
 ```bash
-./scripts/run_miner_node.sh
+bash ./scripts/run_miner.sh
 ```
 
 Expected log behavior:
@@ -185,7 +203,7 @@ Expected log behavior:
 - `Serving miner axon...`
 - `Miner started. Waiting for validator queries.`
 
-### 4) Miner-side notes
+### 3) Miner-side notes
 
 - Baseline miner is intentionally simple; competitive miners should optimize attack logic.
 - Miner does not run llm_endpoint; semantic verification is validator-side only.
@@ -260,22 +278,6 @@ Weight setting:
 - Rank bonuses: `50, 30, 10, 5 (ranks 4-10), 3 (remaining)`
 - Final weights combine normalized rolling average and normalized rank bonus, then normalize to sum 1
 
-## One-Command Launchers
-
-Recommended launch order:
-
-```bash
-./scripts/run_llm_endpoint.sh
-./scripts/run_miner_node.sh
-./scripts/run_validator_node.sh
-```
-
-If scripts are not executable:
-
-```bash
-chmod +x scripts/run_llm_endpoint.sh scripts/run_miner_node.sh scripts/run_validator_node.sh
-```
-
 ## Integration Smoke Test
 
 Run after llm_endpoint is up:
@@ -311,8 +313,8 @@ Use `docs/READINESS_CHECKLIST.md` before long-run validation or deployment.
 - `perturbnet/model.py`: EfficientNet model load and label prediction helpers
 - `perturbnet/image_io.py`: base64 image encode/decode helpers
 - `tools/llm_endpoint_service.py`: validator-side semantic verification service
-- `scripts/run_llm_endpoint.sh`: one-command llm_endpoint launcher
-- `scripts/run_validator_node.sh`: one-command validator launcher
-- `scripts/run_miner_node.sh`: one-command miner launcher
+- `scripts/run_llm_endpoint.sh`: start/restart llm endpoint with PM2
+- `scripts/run_validator.sh`: start/restart validator with PM2
+- `scripts/run_miner.sh`: start/restart miner with PM2
 - `scripts/integration_smoke_test.py`: local integration test
 
