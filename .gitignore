@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+*.npz
+logs/
+scripts/miner.env
+scripts/validator.env
+scripts/verifier.env
+scripts/label_matcher.env
+scripts/llm_endpoint.env
+

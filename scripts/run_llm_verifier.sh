@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+echo "[deprecated] run_llm_verifier.sh -> use ./scripts/run_llm_endpoint.sh"
+exec "$ROOT_DIR/scripts/run_llm_endpoint.sh"
