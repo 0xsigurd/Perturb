@@ -1018,6 +1018,7 @@ class PerturbValidator:
                     logger.warning("Miner selection is empty")
                     time.sleep(self.config.perturb.query_interval_seconds)
                     continue
+                self.system_random.shuffle(miner_uids)
                 self._log_summary(
                     "miner_selection",
                     selected=len(miner_uids),
