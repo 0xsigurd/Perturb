@@ -127,6 +127,8 @@ Edit `scripts/llm_endpoint.env`:
 - `LLM_ENDPOINT_PORT` (default `8081`)
 - `OLLAMA_URL` (default `http://127.0.0.1:11434`)
 - `PERTURB_LLM_ENDPOINT_MODEL` (default `qwen2.5:1.5b-instruct`)
+- `LLM_ENDPOINT_ALLOWED_CIDRS` (default loopback only: `127.0.0.1/32,::1/128`)
+- `LLM_ENDPOINT_ALLOW_PRIVATE_NETWORKS` (`false` by default; set `true` only if the validator reaches the service over a trusted private subnet)
 
 Start llm_endpoint:
 
@@ -157,6 +159,7 @@ Edit required fields in `scripts/validator.env`:
 
 Important validator-specific fields:
 
+- `PERTURB_ENABLE_VALIDATOR_AXON` (`false` recommended unless you explicitly need the validator to serve an axon)
 - `PERTURB_IMAGE_ENDPOINT`
 - `PERTURB_PEXELS_API_KEY` (required)
 - `PERTURB_PEXELS_PER_PAGE`
@@ -191,6 +194,8 @@ Expected log behavior:
 
 - Verification is LLM-only by design; if llm_endpoint is down, challenge verification fails.
 - Keep fallback image `assets/dog_1.jpg` present for external image API outage handling.
+- For hardening, prefer `PERTURB_ENABLE_VALIDATOR_AXON=false` unless your deployment explicitly depends on a public validator axon.
+- `llm_endpoint` now enforces client IP restrictions in code; keep it bound to loopback or a trusted private subnet anyway.
 
 ## Installation and Setup (Miner Side)
 
