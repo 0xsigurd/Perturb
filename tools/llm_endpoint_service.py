@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import time
@@ -7,7 +8,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 
@@ -43,6 +45,26 @@ OLLAMA_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "8"))
 OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0"))
 OLLAMA_TOP_P = float(os.getenv("OLLAMA_TOP_P", "0.1"))
 OLLAMA_TOP_K = int(os.getenv("OLLAMA_TOP_K", "20"))
+ALLOWED_CIDRS_RAW = os.getenv("LLM_ENDPOINT_ALLOWED_CIDRS", "127.0.0.1/32,::1/128").strip()
+ALLOW_PRIVATE_NETWORKS = os.getenv("LLM_ENDPOINT_ALLOW_PRIVATE_NETWORKS", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def _parse_allowed_cidrs(raw: str) -> list[ipaddress._BaseNetwork]:
+    cidrs: list[ipaddress._BaseNetwork] = []
+    for part in raw.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        cidrs.append(ipaddress.ip_network(item, strict=False))
+    return cidrs
+
+
+ALLOWED_CIDRS = _parse_allowed_cidrs(ALLOWED_CIDRS_RAW)
 
 
 def _resolve_model_name(raw: str) -> str:
@@ -53,6 +75,20 @@ def _resolve_model_name(raw: str) -> str:
         "qwen2.5:1.5b-instruct": "qwen2.5:1.5b-instruct",
     }
     return aliases.get(lowered, value)
+
+
+def _client_allowed(host: str | None) -> bool:
+    if not host:
+        return False
+    try:
+        client_ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if client_ip.is_loopback:
+        return True
+    if ALLOW_PRIVATE_NETWORKS and client_ip.is_private:
+        return True
+    return any(client_ip in network for network in ALLOWED_CIDRS)
 
 
 def _prompt(prediction: str, target: str) -> str:
@@ -123,6 +159,17 @@ def _ollama_match(prediction: str, target_label: str, model: str) -> tuple[bool,
     return is_match, reason
 
 
+@app.middleware("http")
+async def restrict_client_ips(request: Request, call_next):
+    client_host = request.client.host if request.client else None
+    if not _client_allowed(client_host):
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={"detail": f"client ip not allowed: {client_host or 'unknown'}"},
+        )
+    return await call_next(request)
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {
@@ -130,6 +177,8 @@ def health() -> dict[str, Any]:
         "uptime_seconds": int(time.time() - _metrics.started_at),
         "default_model": DEFAULT_MODEL,
         "ollama_url": OLLAMA_URL,
+        "allow_private_networks": ALLOW_PRIVATE_NETWORKS,
+        "allowed_cidrs": ALLOWED_CIDRS_RAW,
     }
 
 

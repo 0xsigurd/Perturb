@@ -127,6 +127,13 @@ def _configure_log_level(level_raw: str) -> None:
     pylogging.getLogger().setLevel(level)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _compute_ssim(x_clean: torch.Tensor, x_adv: torch.Tensor, kernel_size: int = 11) -> float:
     if x_clean.ndim != 3 or x_adv.ndim != 3:
         return 0.0
@@ -192,6 +199,7 @@ class PerturbValidator:
         self.metagraph = self.subtensor.metagraph(netuid=self.config.netuid)
         self.dendrite = _make_dendrite(wallet=self.wallet)
         self.axon = _make_axon(wallet=self.wallet, config=self.config)
+        self._attach_reject_all_axon_handlers()
         self._query_loop = asyncio.new_event_loop()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.system_random = random.SystemRandom()
@@ -213,6 +221,33 @@ class PerturbValidator:
 
         self._load_state()
         self._init_wandb()
+
+    def _attach_reject_all_axon_handlers(self) -> None:
+        self.axon.attach(
+            forward_fn=self._reject_inbound_forward,
+            blacklist_fn=self._reject_inbound_blacklist,
+            priority_fn=self._reject_inbound_priority,
+        )
+
+    async def _reject_inbound_forward(self, synapse: AttackChallenge) -> AttackChallenge:
+        logger.warning(
+            "Rejected inbound validator axon request task_id=%s caller_hotkey=%s",
+            getattr(synapse, "task_id", "unknown"),
+            getattr(getattr(synapse, "dendrite", None), "hotkey", None),
+        )
+        return synapse
+
+    async def _reject_inbound_blacklist(self, synapse: AttackChallenge) -> tuple[bool, str]:
+        logger.warning(
+            "Validator axon deny-by-default task_id=%s caller_hotkey=%s",
+            getattr(synapse, "task_id", "unknown"),
+            getattr(getattr(synapse, "dendrite", None), "hotkey", None),
+        )
+        return True, "Validator does not accept inbound subnet requests"
+
+    async def _reject_inbound_priority(self, synapse: AttackChallenge) -> float:
+        _ = synapse
+        return 0.0
 
     def _log_step_start(self, step_name: str, **context: Any) -> None:
         if context:
@@ -920,9 +955,12 @@ class PerturbValidator:
         if self.wallet.hotkey.ss58_address not in self.metagraph.hotkeys:
             raise RuntimeError("Validator hotkey is not registered on this netuid.")
 
-        self._log_step_start("validator_serve_axon", port=getattr(self.config.axon, "port", "unknown"))
-        self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
-        self.axon.start()
+        if bool(getattr(self.config.perturb, "enable_validator_axon", True)):
+            self._log_step_start("validator_serve_axon", port=getattr(self.config.axon, "port", "unknown"))
+            self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
+            self.axon.start()
+        else:
+            logger.info("Validator axon disabled by PERTURB_ENABLE_VALIDATOR_AXON=false")
 
         tempo = self.subtensor.get_subnet_hyperparameters(self.config.netuid).tempo
         logger.info(f"Validator started with tempo={tempo}")
@@ -1114,6 +1152,7 @@ def build_config() -> bt.config:
     config.perturb = perturb_cfg
     for key, value in C.VALIDATOR_CONFIG.items():
         setattr(config.perturb, key, value)
+    config.perturb.enable_validator_axon = _env_bool("PERTURB_ENABLE_VALIDATOR_AXON", True)
     return config
 
 
