@@ -590,8 +590,7 @@ class PerturbValidator:
 
         # Merge miners that likely belong to the same operator:
         # - same coldkey OR same axon ip
-        # Keep one randomly-chosen uid representative from each merged group
-        # so every hotkey in a group gets a fair chance of being queried.
+        # Keep only the lowest uid representative from each merged group.
         parent: dict[int, int] = {uid: uid for uid in candidate_uids}
 
         def _find(uid: int) -> int:
@@ -632,16 +631,14 @@ class PerturbValidator:
                 else:
                     _union(seen_uid, uid)
 
-        uids_by_group: dict[int, list[int]] = {}
+        min_uid_by_group: dict[int, int] = {}
         for uid in candidate_uids:
             root = _find(uid)
-            uids_by_group.setdefault(root, []).append(uid)
+            current_min = min_uid_by_group.get(root)
+            if current_min is None or uid < current_min:
+                min_uid_by_group[root] = uid
 
-        selected: list[int] = []
-        for group_uids in uids_by_group.values():
-            selected.append(self.system_random.choice(group_uids))
-
-        return sorted(selected)
+        return sorted(min_uid_by_group.values())
 
     def _valuable_miner_uids(self, candidate_uids: Sequence[int]) -> list[int]:
         min_processed = int(self.config.perturb.min_processed_count)
