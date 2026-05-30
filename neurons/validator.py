@@ -514,7 +514,7 @@ class PerturbValidator:
                 "challenge_attempt",
                 attempt=attempt + 1,
                 max_attempts=self.config.perturb.max_challenge_attempts,
-                prompt=chosen_prompt,
+                prompt="***",
                 seed=seed,
             )
             self._log_step_start(
@@ -522,7 +522,7 @@ class PerturbValidator:
                 attempt=attempt + 1,
             )
             try:
-                self._log_step_start("challenge_fetch_image", prompt=chosen_prompt, seed=seed)
+                self._log_step_start("challenge_fetch_image", prompt="***", seed=seed)
                 image_b64 = self._fetch_image_for_prompt(prompt=chosen_prompt, seed=seed)
                 effective_prompt = chosen_prompt
                 used_fallback = False
@@ -995,7 +995,7 @@ class PerturbValidator:
                 self._log_summary(
                     "challenge_summary",
                     task_id=challenge.task_id,
-                    prompt=challenge.prompt,
+                    prompt="***",
                     epsilon=f"{challenge.epsilon:.4f}",
                     true_label=challenge.true_label,
                     llm_verified=challenge.verified_by_llm,
@@ -1015,6 +1015,7 @@ class PerturbValidator:
                     logger.warning("Miner selection is empty")
                     time.sleep(self.config.perturb.query_interval_seconds)
                     continue
+                self.system_random.shuffle(miner_uids)
                 self._log_summary(
                     "miner_selection",
                     selected=len(miner_uids),
@@ -1083,6 +1084,7 @@ class PerturbValidator:
                     avg_score = float(sum(rewards) / max(1, len(rewards)))
                     max_score = float(max(rewards)) if rewards else 0.0
                     min_score = float(min(rewards)) if rewards else 0.0
+                    best_uid = results_by_uid[rewards.index(max_score)][0] if rewards else None
                     avg_norm = float(sum(result.norm for _, result in results_by_uid) / max(1, len(results_by_uid)))
                     avg_rmse = float(sum(result.rmse for _, result in results_by_uid) / max(1, len(results_by_uid)))
                     self._log_summary(
@@ -1093,6 +1095,7 @@ class PerturbValidator:
                         avg_score=f"{avg_score:.4f}",
                         min_score=f"{min_score:.4f}",
                         max_score=f"{max_score:.4f}",
+                        best_uid=best_uid,
                         avg_norm=f"{avg_norm:.5f}",
                         avg_rmse=f"{avg_rmse:.5f}",
                         reasons=",".join([f"{k}:{v}" for k, v in sorted(reason_counts.items())]),
