@@ -1,8 +1,8 @@
-bittensor>=8.0.0
-torch>=2.2.0
-torchvision>=0.17.0
-numpy>=1.26.0
-pillow>=10.0.0
+bittensor==10.5.0
+torch==2.12.0
+torchvision==0.27.0
+numpy==2.4.6
+pillow==12.2.0
 requests>=2.31.0
 datasets>=2.19.0
 fastapi>=0.111.0
