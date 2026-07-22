@@ -60,6 +60,7 @@ class EvaluationResult:
     epsilon: float = 0.0
     ssim: float = 0.0
     psnr_db: float = 0.0
+    margin: float = 0.0
 
 
 def _make_wallet(config):
@@ -447,6 +448,7 @@ class PerturbValidator:
         total_weight = max(1e-12, linf_weight + rmse_weight)
         perturbation_score = ((linf_weight * linf_score) + (rmse_weight * rmse_score)) / total_weight
 
+        margin = 0.0
         margin_score = 0.0
         if logits is not None and true_index is not None and 0 <= true_index < logits.shape[1]:
             row = logits[0]
@@ -476,6 +478,7 @@ class PerturbValidator:
             epsilon=float(challenge.epsilon),
             ssim=float(ssim),
             psnr_db=float(psnr_db),
+            margin=float(margin),
         )
 
     def _update_histories(self, uids: Sequence[int], rewards: Sequence[float]) -> None:

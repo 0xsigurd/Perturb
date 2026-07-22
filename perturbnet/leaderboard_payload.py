@@ -58,12 +58,14 @@ def network_metrics(
             avg_score=0.0,
             avg_rmse=0.0,
             avg_norm=0.0,
+            avg_margin=0.0,
             success_count=0,
         )
     return LeaderboardNetworkMetrics(
         avg_score=float(sum(result.score for result in successful_results) / success_count),
         avg_rmse=float(sum(result.rmse for result in successful_results) / success_count),
         avg_norm=float(sum(result.norm for result in successful_results) / success_count),
+        avg_margin=float(sum(result.margin for result in successful_results) / success_count),
         success_count=int(success_count),
     )
 
@@ -87,6 +89,7 @@ def build_report(
                 graph=score_graph(score_histories, uid),
                 rmse=float(result.rmse),
                 norm=float(result.norm),
+                margin=float(result.margin),
                 result=result_status(result),
                 image_url=image_url_by_uid.get(uid) or C.LEADERBOARD_NO_IMAGE_URL,
             )
