@@ -714,7 +714,7 @@ class PerturbValidator:
                 logger.error(f"set_weights failed (all zero): {msg}")
             return bool(ok)
 
-        # Ranks 3+ split the final 15% by descending rank weight, not evenly.
+        # Ranks 3-10 split the final 15% by descending rank weight, not evenly.
         for uid, share in ranked_emission_shares(positive_uids).items():
             emission_raw[uid] = float(share)
 
