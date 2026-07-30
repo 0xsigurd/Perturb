@@ -245,7 +245,7 @@ Labels are normalized with `strip -> lowercase -> replace "_" with " "`. When po
 
 Weight setting:
 
-- Only miners with a full `PERTURB_HISTORY_SIZE` score history are weight-eligible
+- Miners are weight-eligible once their score history reaches the effective window: `min(PERTURB_HISTORY_SIZE, longest miner history)`. Weight setting starts once the longest history reaches `PERTURB_MIN_WEIGHT_HISTORY_SIZE` (default `50`), so new validators don't wait for the full window, while miners still need as many records as the current longest history (capped at `PERTURB_HISTORY_SIZE`).
 - Emission schedule: rank 1 receives `70%`, rank 2 receives `15%`, and the remaining `15%` is split by descending rank weight among all other positive-score eligible miners
 - At each weight-setting cycle, the validator fetches `burnRate` from the burn endpoint configured in `perturbnet/constants.py` and assigns that share to the configured burn UID. Miner weights are scaled by `1 - burnRate`, keeping the submitted vector normalized. If the API is unavailable or invalid, the default burn rate from `constants.py` is used instead.
 

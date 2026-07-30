@@ -55,6 +55,7 @@ CHALLENGE_RETRY_DELAY_SECONDS = _env_int("PERTURB_CHALLENGE_RETRY_DELAY_SECONDS"
 IMAGE_SIZE = _env_int("PERTURB_IMAGE_SIZE", 64)
 K_MINERS = _env_int("PERTURB_K_MINERS", 150)
 HISTORY_SIZE = _env_int("PERTURB_HISTORY_SIZE", 300)
+MIN_WEIGHT_HISTORY_SIZE = _env_int("PERTURB_MIN_WEIGHT_HISTORY_SIZE", 50)
 MIN_LINF_DELTA = _env_float("PERTURB_MIN_LINF_DELTA", 0.003)
 MAX_LINF_DELTA = _env_float("PERTURB_MAX_LINF_DELTA", 0.03)
 MIN_SSIM = _env_float("PERTURB_MIN_SSIM", 0.98)
@@ -101,6 +102,7 @@ VALIDATOR_CONFIG = {
     "image_size": IMAGE_SIZE,
     "k_miners": K_MINERS,
     "history_size": HISTORY_SIZE,
+    "min_weight_history_size": MIN_WEIGHT_HISTORY_SIZE,
     "min_linf_delta": MIN_LINF_DELTA,
     "max_linf_delta": MAX_LINF_DELTA,
     "min_ssim": MIN_SSIM,

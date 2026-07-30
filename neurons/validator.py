@@ -645,23 +645,45 @@ class PerturbValidator:
         )
         eligible: list[tuple[int, float]] = []
         history_size = int(self.config.perturb.history_size)
+        min_history = int(
+            getattr(self.config.perturb, "min_weight_history_size", C.MIN_WEIGHT_HISTORY_SIZE)
+        )
         burn_uid = int(getattr(self.config.perturb, "burn_uid", 0))
         if burn_uid < 0 or burn_uid >= int(self.metagraph.n):
             logger.warning(f"Configured burn_uid={burn_uid} is outside metagraph; falling back to UID 0.")
             burn_uid = 0
+        # Until any miner reaches the full history window, eligibility follows
+        # the longest available history so new validators can set weights
+        # early without letting short-history miners qualify prematurely.
+        longest_history = max(
+            (len(self.score_histories[uid]) for uid in range(int(self.metagraph.n)) if uid != burn_uid),
+            default=0,
+        )
+        effective_history_size = min(history_size, longest_history)
+        if effective_history_size < min_history:
+            logger.warning(
+                f"Longest miner history {longest_history} is below the minimum {min_history}; "
+                "skipping weight setting."
+            )
+            return False
+        if effective_history_size < history_size:
+            logger.info(
+                f"Using effective_history_size={effective_history_size} "
+                f"(longest available history) instead of history_size={history_size}."
+            )
         burn_rate = self._fetch_burn_rate()
         for uid in range(int(self.metagraph.n)):
             if uid == burn_uid:
                 continue
             history = self.score_histories[uid]
-            if len(history) < history_size:
+            if len(history) < effective_history_size:
                 continue
-            tail = history[-history_size:]
-            avg_score = float(sum(tail) / history_size)
+            tail = history[-effective_history_size:]
+            avg_score = float(sum(tail) / effective_history_size)
             eligible.append((uid, avg_score))
 
         if not eligible:
-            logger.warning(f"No eligible miners with full history_size={history_size}.")
+            logger.warning(f"No eligible miners with history_size={effective_history_size}.")
             return False
 
         eligible.sort(key=lambda x: (x[1], -x[0]), reverse=True)
