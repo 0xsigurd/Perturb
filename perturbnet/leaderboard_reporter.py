@@ -23,6 +23,7 @@ class LeaderboardMinerResult:
     graph: list[int | float]
     rmse: float
     norm: float
+    margin: float
     result: str
     image_url: str
 
@@ -32,6 +33,7 @@ class LeaderboardNetworkMetrics:
     avg_score: float
     avg_rmse: float
     avg_norm: float
+    avg_margin: float
     success_count: int
 
 
