@@ -72,6 +72,9 @@ BURN_RATE_ENDPOINT = "https://api.perturbai.io/api/v1/burn-rate"
 DEFAULT_BURN_RATE = 0.0
 BURN_RATE_FETCH_TIMEOUT_SECONDS = 5.0
 BURN_UID = 0
+# Validators set weights once per epoch, inside the final N blocks before the
+# next epoch, so all validators submit at (roughly) the same moment.
+WEIGHT_WINDOW_BLOCKS = _env_int("PERTURB_WEIGHT_WINDOW_BLOCKS", 100)
 LEADERBOARD_REPORTING_ENABLED = _env_bool("PERTURB_LEADERBOARD_ENABLED", False)
 LEADERBOARD_API_URL = "https://api.perturbai.io/api/v1/report"
 LEADERBOARD_LAST_WEIGHT_UPDATE_API_URL = "https://api.perturbai.io/api/v1/last-weight-update"
@@ -119,6 +122,7 @@ VALIDATOR_CONFIG = {
     "default_burn_rate": DEFAULT_BURN_RATE,
     "burn_rate_fetch_timeout_seconds": BURN_RATE_FETCH_TIMEOUT_SECONDS,
     "burn_uid": BURN_UID,
+    "weight_window_blocks": WEIGHT_WINDOW_BLOCKS,
     "leaderboard_reporting_enabled": LEADERBOARD_REPORTING_ENABLED,
     "leaderboard_api_url": LEADERBOARD_API_URL,
     "leaderboard_last_weight_update_api_url": LEADERBOARD_LAST_WEIGHT_UPDATE_API_URL,

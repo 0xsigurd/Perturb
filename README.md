@@ -245,7 +245,10 @@ Labels are normalized with `strip -> lowercase -> replace "_" with " "`. When po
 
 Weight setting:
 
-- Miners are weight-eligible once their score history reaches the effective window: `min(PERTURB_HISTORY_SIZE, longest miner history)`. Weight setting starts once the longest history reaches `PERTURB_MIN_WEIGHT_HISTORY_SIZE` (default `50`), so new validators don't wait for the full window, while miners still need as many records as the current longest history (capped at `PERTURB_HISTORY_SIZE`).
+- Weights are set once per epoch, inside the final `PERTURB_WEIGHT_WINDOW_BLOCKS` (default `100`) blocks before the next epoch boundary, so all validators submit at roughly the same moment. The boundary is computed from the chain's own counters (`last_step + tempo`); `scripts/epoch_countdown.py` prints the live countdown.
+- At weight-setting time, the validator fetches every validator's leaderboard report from `GET /leaderboard/<validator_hotkey>` and averages each miner's `avgScore` across all reporting validators. These consensus averages are the only input to weight setting; validators whose leaderboard fetch fails are skipped. If no consensus data is available at all, weight setting is skipped for that cycle.
+- Validators are identified by validator permit plus a minimum stake of `10,000`.
+- History gating happens at reporting time, not weight-setting time: a miner's reported `avgScore` averages over `min(PERTURB_HISTORY_SIZE, longest miner history)` records and is `0` until the miner reaches that window (or until any miner reaches `PERTURB_MIN_WEIGHT_HISTORY_SIZE`, default `50`).
 - Emission schedule: rank 1 receives `70%`, rank 2 receives `15%`, and the remaining `15%` is split by descending rank weight among positive-score miners ranked 3 through 10; miners ranked below 10 receive no emission share
 - At each weight-setting cycle, the validator fetches `burnRate` from the burn endpoint configured in `perturbnet/constants.py` and assigns that share to the configured burn UID. Miner weights are scaled by `1 - burnRate`, keeping the submitted vector normalized. If the API is unavailable or invalid, the default burn rate from `constants.py` is used instead.
 

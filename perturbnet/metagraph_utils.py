@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 
-VALIDATOR_STAKE_THRESHOLD = 100_000.0
+VALIDATOR_STAKE_THRESHOLD = 10_000.0
 
 
 def _sequence_value(values: Any, uid: int, default: Any = None) -> Any:
