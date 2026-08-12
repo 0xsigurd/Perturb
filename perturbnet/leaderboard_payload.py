@@ -12,11 +12,35 @@ def update_score_histories(histories: list[list[float]], uids: Sequence[int], re
         histories[uid] = histories[uid][-int(window):]
 
 
+def effective_avg_window(
+    histories: list[list[float]],
+    uids: Sequence[int],
+    window: int,
+    min_window: int,
+) -> int:
+    """Averaging window used for reported avg_scores.
+
+    Follows the longest miner history (capped at `window`) so short-history
+    miners can't report a competitive average. Returns 0 when no miner has
+    reached `min_window` records yet, which zeroes every reported avg_score.
+    """
+    longest_history = max(
+        (len(histories[uid]) for uid in uids if 0 <= uid < len(histories)),
+        default=0,
+    )
+    if longest_history < int(min_window):
+        return 0
+    return min(int(window), longest_history)
+
+
 def avg_score(histories: list[list[float]], uid: int, window: int) -> float:
-    history = histories[uid][-int(window):]
-    if not history:
+    if int(window) <= 0 or uid >= len(histories):
         return 0.0
-    return float(sum(history) / len(history))
+    history = histories[uid]
+    if len(history) < int(window):
+        return 0.0
+    tail = history[-int(window):]
+    return float(sum(tail) / len(tail))
 
 
 GRAPH_SCORE_LIMIT = 50
@@ -78,13 +102,20 @@ def build_report(
     avg_window: int,
     results_by_uid: Sequence[tuple[int, Any]],
     image_url_by_uid: dict[int, str],
+    min_avg_window: int = C.MIN_WEIGHT_HISTORY_SIZE,
 ) -> LeaderboardReport:
+    window = effective_avg_window(
+        score_histories,
+        [uid for uid, _ in results_by_uid],
+        avg_window,
+        min_avg_window,
+    )
     miners: list[LeaderboardMinerResult] = []
     for uid, result in results_by_uid:
         miners.append(
             LeaderboardMinerResult(
                 uid=int(uid),
-                avg_score=avg_score(score_histories, uid, avg_window),
+                avg_score=avg_score(score_histories, uid, window),
                 last_score=float(result.score),
                 graph=score_graph(score_histories, uid),
                 rmse=float(result.rmse),

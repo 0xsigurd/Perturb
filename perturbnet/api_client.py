@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -114,6 +115,37 @@ def submit_miner_response(
         timeout=timeout_seconds,
     )
     return _json_response(response)
+
+
+def get_leaderboard_avg_scores(
+    *,
+    base_url: str,
+    validator_hotkey: str,
+    timeout_seconds: float,
+) -> dict[int, float]:
+    """Return miner uid -> avgScore from one validator's leaderboard report."""
+    response = requests.get(
+        _url(base_url, f"/leaderboard/{validator_hotkey}"),
+        timeout=timeout_seconds,
+    )
+    payload = _json_response(response)
+    if not isinstance(payload, dict):
+        return {}
+    raw_miners = payload.get("miners")
+    if not isinstance(raw_miners, list):
+        return {}
+    scores: dict[int, float] = {}
+    for item in raw_miners:
+        if not isinstance(item, dict):
+            continue
+        try:
+            uid = int(item.get("uid"))
+            avg_score = float(item.get("avgScore", item.get("avg_score")))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(avg_score):
+            scores[uid] = avg_score
+    return scores
 
 
 def get_submitted_responses(*, base_url: str, api_key: str, timeout_seconds: float) -> list[SubmittedResponse]:

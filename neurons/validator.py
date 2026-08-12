@@ -19,12 +19,19 @@ import torch
 import torch.nn.functional as F
 
 from perturbnet import constants as C
-from perturbnet.api_client import SubmittedResponse, get_current_task, get_submitted_responses
+from perturbnet.api_client import (
+    SubmittedResponse,
+    get_current_task,
+    get_leaderboard_avg_scores,
+    get_submitted_responses,
+)
 from perturbnet.duplicate_responses import zero_duplicate_responses
 from perturbnet.emissions import ranked_emission_shares
+from perturbnet.epoch_timing import epoch_countdown
 from perturbnet.image_io import changed_pixel_count, decode_image_b64, image_url_to_b64, quantize_image_uint8_grid
 from perturbnet.leaderboard_payload import build_report, update_score_histories
 from perturbnet.leaderboard_reporter import LeaderboardReporter
+from perturbnet.metagraph_utils import is_validator_neuron
 from perturbnet.metagraph_utils import miner_uids as metagraph_miner_uids
 from perturbnet.model import (
     label_for_index,
@@ -509,6 +516,9 @@ class PerturbValidator:
                 avg_window=int(getattr(self.config.perturb, "history_size", C.HISTORY_SIZE)),
                 results_by_uid=results_by_uid,
                 image_url_by_uid=image_url_by_uid,
+                min_avg_window=int(
+                    getattr(self.config.perturb, "min_weight_history_size", C.MIN_WEIGHT_HISTORY_SIZE)
+                ),
             )
         )
 
@@ -641,54 +651,71 @@ class PerturbValidator:
             logger.warning(f"Failed to fetch burn rate from {endpoint}; using fallback burn={fallback:.4f}: {exc}")
             return fallback
 
+    def _validator_hotkeys(self) -> list[str]:
+        return [
+            str(self.metagraph.hotkeys[uid])
+            for uid in range(int(self.metagraph.n))
+            if is_validator_neuron(self.metagraph, uid)
+        ]
+
+    def _fetch_consensus_avg_scores(self) -> dict[int, float]:
+        """Average each miner's avg_score across all validators' leaderboard reports."""
+        base_url = str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL))
+        timeout_seconds = float(
+            getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)
+        )
+        totals: dict[int, float] = {}
+        counts: dict[int, int] = {}
+        reporting_validators = 0
+        for hotkey in self._validator_hotkeys():
+            try:
+                scores = get_leaderboard_avg_scores(
+                    base_url=base_url,
+                    validator_hotkey=hotkey,
+                    timeout_seconds=timeout_seconds,
+                )
+            except Exception as exc:
+                logger.debug(f"Leaderboard scores unavailable validator={hotkey}: {exc}")
+                continue
+            if not scores:
+                continue
+            reporting_validators += 1
+            for uid, avg_score in scores.items():
+                totals[uid] = totals.get(uid, 0.0) + avg_score
+                counts[uid] = counts.get(uid, 0) + 1
+        consensus = {uid: totals[uid] / counts[uid] for uid in totals}
+        logger.info(
+            f"Consensus avg scores gathered validators={reporting_validators} miners={len(consensus)}"
+        )
+        return consensus
+
     def _set_weights(self, *, block: int) -> bool:
-        self._log_step_start(
-            "set_weights",
-            history_size=self.config.perturb.history_size,
-        )
-        eligible: list[tuple[int, float]] = []
-        history_size = int(self.config.perturb.history_size)
-        min_history = int(
-            getattr(self.config.perturb, "min_weight_history_size", C.MIN_WEIGHT_HISTORY_SIZE)
-        )
+        self._log_step_start("set_weights")
         burn_uid = int(getattr(self.config.perturb, "burn_uid", 0))
         if burn_uid < 0 or burn_uid >= int(self.metagraph.n):
             logger.warning(f"Configured burn_uid={burn_uid} is outside metagraph; falling back to UID 0.")
             burn_uid = 0
-        # Until any miner reaches the full history window, eligibility follows
-        # the longest available history so new validators can set weights
-        # early without letting short-history miners qualify prematurely.
-        longest_history = max(
-            (len(self.score_histories[uid]) for uid in range(int(self.metagraph.n)) if uid != burn_uid),
-            default=0,
-        )
-        effective_history_size = min(history_size, longest_history)
-        if effective_history_size < min_history:
-            logger.warning(
-                f"Longest miner history {longest_history} is below the minimum {min_history}; "
-                "skipping weight setting."
-            )
-            return False
-        if effective_history_size < history_size:
-            logger.info(
-                f"Using effective_history_size={effective_history_size} "
-                f"(longest available history) instead of history_size={history_size}."
-            )
-        burn_rate = self._fetch_burn_rate()
-        for uid in range(int(self.metagraph.n)):
-            if uid == burn_uid:
-                continue
-            history = self.score_histories[uid]
-            if len(history) < effective_history_size:
-                continue
-            tail = history[-effective_history_size:]
-            avg_score = float(sum(tail) / effective_history_size)
-            eligible.append((uid, avg_score))
 
+        # Weights come exclusively from the network-wide consensus: each
+        # miner's avg_score is averaged across every reporting validator's
+        # leaderboard. History gating lives upstream in the leaderboard
+        # payload (short-history miners report avg_score=0), so no local
+        # history checks are needed here.
+        consensus_scores = self._fetch_consensus_avg_scores()
+        if not consensus_scores:
+            logger.warning("No consensus scores available from leaderboard API; skipping weight setting.")
+            return False
+
+        eligible = [
+            (uid, float(score))
+            for uid, score in consensus_scores.items()
+            if uid != burn_uid and 0 <= uid < int(self.metagraph.n)
+        ]
         if not eligible:
-            logger.warning(f"No eligible miners with history_size={effective_history_size}.")
+            logger.warning("Consensus contains no scorable miners; skipping weight setting.")
             return False
 
+        burn_rate = self._fetch_burn_rate()
         eligible.sort(key=lambda x: (x[1], -x[0]), reverse=True)
         n_eligible = len(eligible)
         emission_raw = np.zeros(int(self.metagraph.n), dtype=np.float32)
@@ -955,11 +982,23 @@ class PerturbValidator:
                 self._log_step_start("loop_save_state")
                 self._save_state()
 
-                blocks_since_weights = block - self.last_weight_block
-                if blocks_since_weights >= tempo:
-                    self._log_step_start("loop_maybe_set_weights", blocks_since_weights=blocks_since_weights, tempo=tempo)
-                    if self._set_weights(block=block):
-                        self.last_weight_block = block
+                # Weights are set once per epoch, inside the final
+                # WEIGHT_WINDOW_BLOCKS blocks before the next epoch, so every
+                # validator submits at (roughly) the same moment.
+                countdown = epoch_countdown(self.subtensor, self.config.netuid)
+                weight_window_blocks = int(
+                    getattr(self.config.perturb, "weight_window_blocks", C.WEIGHT_WINDOW_BLOCKS)
+                )
+                in_weight_window = countdown.blocks_remaining <= weight_window_blocks
+                already_set_this_epoch = self.last_weight_block > countdown.last_epoch_block
+                if in_weight_window and not already_set_this_epoch:
+                    self._log_step_start(
+                        "loop_maybe_set_weights",
+                        blocks_remaining=countdown.blocks_remaining,
+                        next_epoch_block=countdown.next_epoch_block,
+                    )
+                    if self._set_weights(block=countdown.current_block):
+                        self.last_weight_block = countdown.current_block
 
                 self.step += 1
             except KeyboardInterrupt:
