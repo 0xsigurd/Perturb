@@ -28,7 +28,13 @@ from perturbnet.api_client import (
 from perturbnet.duplicate_responses import zero_duplicate_responses
 from perturbnet.emissions import ranked_emission_shares
 from perturbnet.epoch_timing import epoch_countdown
-from perturbnet.image_io import changed_pixel_count, decode_image_b64, image_url_to_b64, quantize_image_uint8_grid
+from perturbnet.image_io import (
+    changed_pixel_count,
+    decode_image_b64,
+    image_pixel_hash,
+    image_url_to_b64,
+    quantize_image_uint8_grid,
+)
 from perturbnet.leaderboard_payload import build_report, update_score_histories
 from perturbnet.leaderboard_reporter import LeaderboardReporter
 from perturbnet.metagraph_utils import is_validator_neuron
@@ -899,10 +905,35 @@ class PerturbValidator:
                             response_hash_by_uid[uid] = hashlib.sha256(base64.b64decode(perturbed_image_b64)).hexdigest()
                         except Exception:
                             pass
-                        result = self.verify_and_score(
-                            challenge=challenge,
-                            perturbed_image_b64=perturbed_image_b64,
-                        )
+                        # The submitted hash pins the image content at submit
+                        # time; a mismatch means the file behind the URL was
+                        # swapped after submission.
+                        submitted_hash = str(submitted.image_hash or "").strip().lower()
+                        try:
+                            downloaded_hash = image_pixel_hash(perturbed_image_b64)
+                        except Exception:
+                            downloaded_hash = ""
+                        if not submitted_hash:
+                            result = EvaluationResult(
+                                score=0.0,
+                                reason="image_hash_missing",
+                                model_prediction="unavailable",
+                            )
+                        elif submitted_hash != downloaded_hash:
+                            logger.warning(
+                                f"Image hash mismatch uid={uid} submitted={submitted_hash[:12]} "
+                                f"downloaded={downloaded_hash[:12]} url={submitted.image_url}"
+                            )
+                            result = EvaluationResult(
+                                score=0.0,
+                                reason="image_hash_mismatch",
+                                model_prediction="unavailable",
+                            )
+                        else:
+                            result = self.verify_and_score(
+                                challenge=challenge,
+                                perturbed_image_b64=perturbed_image_b64,
+                            )
                     results_by_uid.append((uid, result))
 
                 zero_duplicate_responses(results_by_uid=results_by_uid, response_hash_by_uid=response_hash_by_uid)
