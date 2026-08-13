@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 from perturbnet import constants as C
 from perturbnet.api_client import get_current_task, submit_miner_response
-from perturbnet.image_io import decode_image_b64, encode_image_b64, image_url_to_b64
+from perturbnet.image_io import decode_image_b64, encode_image_b64, image_pixel_hash, image_url_to_b64
 from perturbnet.model import load_efficientnet_v2_l, logits_for_images, predict_index, predict_label, resolve_target_index
 from perturbnet.storage_uploader import ImageStorageUploader
 from perturbnet.task_timing import sleep_until_next_task_boundary
@@ -207,10 +207,14 @@ class PerturbMiner:
             task_id=task_id,
             perturbed_image_b64=perturbed_image_b64,
         )
+        # Validators recompute this pixel hash from the downloaded image and
+        # zero the submission if the content at the URL changed after submit.
+        image_hash = image_pixel_hash(perturbed_image_b64)
         submit_response = submit_miner_response(
             base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
             wallet=self.wallet,
             image_url=response_url,
+            image_hash=image_hash,
             timeout_seconds=float(getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)),
         )
         if not self._submission_succeeded(submit_response):
