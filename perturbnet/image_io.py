@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 
 import numpy as np
@@ -33,6 +34,22 @@ def image_url_to_b64(image_url: str, *, timeout_seconds: float = 10.0) -> str:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+def image_pixel_hash(image_b64: str) -> str:
+    """sha256 over the decoded RGB pixel buffer (shape-prefixed).
+
+    Hashing pixels instead of file bytes keeps the hash stable across the
+    lossless PNG re-encodes in the upload/download pipeline, while still
+    changing if the image content at a URL is modified after submission.
+    """
+    raw = base64.b64decode(image_b64)
+    image = Image.open(io.BytesIO(raw)).convert("RGB")
+    arr = np.asarray(image, dtype=np.uint8)
+    digest = hashlib.sha256()
+    digest.update(f"{arr.shape[0]}x{arr.shape[1]}".encode("utf-8"))
+    digest.update(arr.tobytes())
+    return digest.hexdigest()
 
 
 def quantize_image_uint8_grid(image_chw: torch.Tensor) -> torch.Tensor:

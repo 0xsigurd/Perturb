@@ -19,6 +19,7 @@ class CurrentTask:
 class SubmittedResponse:
     miner_uid: int
     image_url: str
+    image_hash: str = ""
 
 
 def _url(base_url: str, path: str) -> str:
@@ -35,6 +36,10 @@ def _json_response(response: requests.Response) -> Any:
 
 def _image_url_from_payload(payload: dict[str, Any]) -> str:
     return str(payload.get("imageURL") or payload.get("imageUrl") or payload.get("image_url") or "").strip()
+
+
+def _image_hash_from_payload(payload: dict[str, Any]) -> str:
+    return str(payload.get("imageHash") or payload.get("image_hash") or "").strip().lower()
 
 
 def sign_body(wallet: Any, body: bytes) -> str:
@@ -95,6 +100,7 @@ def submit_miner_response(
     base_url: str,
     wallet: Any,
     image_url: str,
+    image_hash: str,
     timeout_seconds: float,
 ) -> Any:
     hotkey = str(getattr(getattr(wallet, "hotkey", None), "ss58_address", ""))
@@ -102,6 +108,7 @@ def submit_miner_response(
         "miner_hotkey": hotkey,
         "timestamp": datetime.now(UTC).isoformat(),
         "imageURL": image_url,
+        "imageHash": str(image_hash).strip().lower(),
     }
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     response = requests.post(
@@ -169,6 +176,12 @@ def get_submitted_responses(*, base_url: str, api_key: str, timeout_seconds: flo
         except (TypeError, ValueError):
             continue
         if image_url:
-            responses.append(SubmittedResponse(miner_uid=miner_uid, image_url=image_url))
+            responses.append(
+                SubmittedResponse(
+                    miner_uid=miner_uid,
+                    image_url=image_url,
+                    image_hash=_image_hash_from_payload(item),
+                )
+            )
     return responses
 

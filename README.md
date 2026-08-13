@@ -206,8 +206,8 @@ The generator samples ImageNet-100, uploads the clean task image with the config
 
 - Task generator publishes the current task with `task_id` and `imageURL`.
 - Miners read the current task from `GET /task`.
-- Miners submit response image URLs to `POST /submits`.
-- Validators read submitted response image URLs from `GET /submits` (Bearer auth, available while task status is `validating`).
+- Miners submit their response image URL plus `imageHash` to `POST /submits`. The hash is sha256 over the decoded RGB pixel buffer of the perturbed image (see `image_pixel_hash` in `perturbnet/image_io.py`), so it is stable across lossless PNG re-encodes.
+- Validators read submitted response image URLs and hashes from `GET /submits` (Bearer auth, available while task status is `validating`). At evaluation time the validator recomputes the pixel hash from the downloaded image; a missing hash (`image_hash_missing`) or a mismatch (`image_hash_mismatch`) zeroes the submission. This prevents miners from submitting a URL early and swapping the image content behind it afterwards.
 
 ### Task generator
 
