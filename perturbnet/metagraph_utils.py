@@ -29,12 +29,15 @@ def _as_bool(value: Any) -> bool:
     return bool(value)
 
 
+def neuron_stake(metagraph: Any, uid: int) -> float:
+    stakes = getattr(metagraph, "stake", getattr(metagraph, "S", []))
+    return _as_float(_sequence_value(stakes, uid, 0.0))
+
+
 def is_validator_neuron(metagraph: Any, uid: int) -> bool:
     permits = getattr(metagraph, "validator_permit", getattr(metagraph, "validator_permits", []))
-    stakes = getattr(metagraph, "stake", getattr(metagraph, "S", []))
     has_permit = _as_bool(_sequence_value(permits, uid, False))
-    stake = _as_float(_sequence_value(stakes, uid, 0.0))
-    return has_permit and stake > VALIDATOR_STAKE_THRESHOLD
+    return has_permit and neuron_stake(metagraph, uid) > VALIDATOR_STAKE_THRESHOLD
 
 
 def count_miners(metagraph: Any) -> int:
