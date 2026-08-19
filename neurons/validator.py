@@ -37,7 +37,7 @@ from perturbnet.image_io import (
 )
 from perturbnet.leaderboard_payload import build_report, update_score_histories
 from perturbnet.leaderboard_reporter import LeaderboardReporter
-from perturbnet.metagraph_utils import is_validator_neuron
+from perturbnet.metagraph_utils import is_validator_neuron, neuron_stake
 from perturbnet.metagraph_utils import miner_uids as metagraph_miner_uids
 from perturbnet.model import (
     label_for_index,
@@ -657,23 +657,25 @@ class PerturbValidator:
             logger.warning(f"Failed to fetch burn rate from {endpoint}; using fallback burn={fallback:.4f}: {exc}")
             return fallback
 
-    def _validator_hotkeys(self) -> list[str]:
+    def _validators_with_stake(self) -> list[tuple[str, float]]:
         return [
-            str(self.metagraph.hotkeys[uid])
+            (str(self.metagraph.hotkeys[uid]), neuron_stake(self.metagraph, uid))
             for uid in range(int(self.metagraph.n))
             if is_validator_neuron(self.metagraph, uid)
         ]
 
     def _fetch_consensus_avg_scores(self) -> dict[int, float]:
-        """Average each miner's avg_score across all validators' leaderboard reports."""
+        """Stake-weighted average of each miner's avg_score across all validators' reports."""
         base_url = str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL))
         timeout_seconds = float(
             getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)
         )
         totals: dict[int, float] = {}
-        counts: dict[int, int] = {}
+        stake_totals: dict[int, float] = {}
         reporting_validators = 0
-        for hotkey in self._validator_hotkeys():
+        for hotkey, stake in self._validators_with_stake():
+            if stake <= 0.0:
+                continue
             try:
                 scores = get_leaderboard_avg_scores(
                     base_url=base_url,
@@ -687,11 +689,12 @@ class PerturbValidator:
                 continue
             reporting_validators += 1
             for uid, avg_score in scores.items():
-                totals[uid] = totals.get(uid, 0.0) + avg_score
-                counts[uid] = counts.get(uid, 0) + 1
-        consensus = {uid: totals[uid] / counts[uid] for uid in totals}
+                totals[uid] = totals.get(uid, 0.0) + avg_score * stake
+                stake_totals[uid] = stake_totals.get(uid, 0.0) + stake
+        consensus = {uid: totals[uid] / stake_totals[uid] for uid in totals if stake_totals[uid] > 0.0}
         logger.info(
-            f"Consensus avg scores gathered validators={reporting_validators} miners={len(consensus)}"
+            f"Consensus avg scores gathered validators={reporting_validators} miners={len(consensus)} "
+            "(stake-weighted)"
         )
         return consensus
 
@@ -750,7 +753,7 @@ class PerturbValidator:
                 logger.error(f"set_weights failed (all zero): {msg}")
             return bool(ok)
 
-        # Ranks 3-10 split the final 15% by descending rank weight, not evenly.
+        # Ranks 4-10 split the final 5% by descending rank weight, not evenly.
         for uid, share in ranked_emission_shares(positive_uids).items():
             emission_raw[uid] = float(share)
 
