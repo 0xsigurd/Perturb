@@ -8,3 +8,5 @@ logs/
 scripts/miner.env
 scripts/validator.env
 
+training/.env
+training/runs/

@@ -10,6 +10,7 @@ import os
 import time
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
 
 import bittensor as bt
@@ -23,10 +24,13 @@ from perturbnet.api_client import (
     SubmittedResponse,
     get_current_task,
     get_leaderboard_avg_scores,
+    get_model_evaluation_report,
+    get_previous_commitments,
     get_submitted_responses,
+    post_model_evaluation,
 )
 from perturbnet.duplicate_responses import zero_duplicate_responses
-from perturbnet.emissions import ranked_emission_shares
+from perturbnet.emissions import blend_track_weights, ranked_emission_shares
 from perturbnet.epoch_timing import epoch_countdown
 from perturbnet.image_io import (
     changed_pixel_count,
@@ -46,6 +50,16 @@ from perturbnet.model import (
     normalize_prediction_label,
     predict_label,
     resolve_target_index,
+)
+from perturbnet.model_evaluation import (
+    EvaluationDataUnavailable,
+    ModelEvaluationOutcome,
+    ModelEvaluator,
+    ModelEvaluatorConfig,
+    ValidatorEvaluationReport,
+    consensus_model_winner,
+    evaluation_date,
+    evaluation_due,
 )
 from perturbnet.task_timing import sleep_until_next_task_boundary
 
@@ -118,6 +132,8 @@ def _configure_log_level(level_raw: str) -> None:
         format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     )
     pylogging.getLogger().setLevel(level)
+    for noisy in ("httpx", "httpcore", "huggingface_hub", "datasets", "filelock", "fsspec", "urllib3"):
+        pylogging.getLogger(noisy).setLevel(pylogging.WARNING)
 
 
 def _compute_ssim(x_clean: torch.Tensor, x_adv: torch.Tensor, kernel_size: int = 11) -> float:
@@ -148,6 +164,15 @@ def _compute_psnr_db(x_clean: torch.Tensor, x_adv: torch.Tensor) -> float:
     if mse <= 1e-12:
         return 99.0
     return 10.0 * math.log10(1.0 / mse)
+
+
+def _set_weights_failure(msg: Any) -> str:
+    # bittensor returns an ExtrinsicResponse(False) with no message when it made
+    # no attempt at all, which happens when the weights rate limit has not
+    # elapsed since this hotkey's last update.
+    if msg is None or not str(msg).strip():
+        return "no attempt made (weights rate limit not yet elapsed since the last update; retried next epoch)"
+    return str(msg)
 
 
 class PerturbValidator:
@@ -189,6 +214,10 @@ class PerturbValidator:
         # intentionally follows HISTORY_SIZE so operators have one history knob.
         self.leaderboard_score_histories: list[list[float]] = [[] for _ in range(int(self.metagraph.n))]
         self.uid_hotkeys: list[str] = list(self.metagraph.hotkeys[: int(self.metagraph.n)])
+
+        self.model_eval_date = ""
+        self.model_winner_uid: int | None = None
+        self.model_winner_hotkey = ""
 
         self._load_state()
 
@@ -259,6 +288,12 @@ class PerturbValidator:
             if previous_hotkey and previous_hotkey != current_hotkey:
                 self._reset_uid_stats(uid, reason="hotkey_changed")
             self.uid_hotkeys[uid] = current_hotkey
+        if self.model_winner_uid is not None:
+            uid = int(self.model_winner_uid)
+            if not (0 <= uid < n) or str(self.metagraph.hotkeys[uid]) != self.model_winner_hotkey:
+                logger.info(f"Model winner uid={uid} left the metagraph or changed hotkey; dropping model score.")
+                self.model_winner_uid = None
+                self.model_winner_hotkey = ""
 
     def _load_state(self) -> None:
         if not os.path.exists(self.state_path):
@@ -301,6 +336,10 @@ class PerturbValidator:
                 if isinstance(value, str):
                     self.uid_hotkeys[idx] = value
         self.last_validated_api_task_id = str(state.get("last_validated_api_task_id", "") or "")
+        self.model_eval_date = str(state.get("model_eval_date", "") or "")
+        raw_winner = state.get("model_winner_uid")
+        self.model_winner_uid = int(raw_winner) if isinstance(raw_winner, int) and raw_winner >= 0 else None
+        self.model_winner_hotkey = str(state.get("model_winner_hotkey", "") or "")
         self._reconcile_uid_identities()
 
     def _save_state(self) -> None:
@@ -318,6 +357,9 @@ class PerturbValidator:
             ],
             "uid_hotkeys": self.uid_hotkeys,
             "last_validated_api_task_id": self.last_validated_api_task_id,
+            "model_eval_date": self.model_eval_date,
+            "model_winner_uid": self.model_winner_uid,
+            "model_winner_hotkey": self.model_winner_hotkey,
         }
         tmp_path = f"{self.state_path}.tmp"
         with open(tmp_path, "w", encoding="utf-8") as handle:
@@ -698,6 +740,134 @@ class PerturbValidator:
         )
         return consensus
 
+    # ------------------------------------------------------------------ model track
+
+    def _model_evaluation_due(self) -> bool:
+        if not bool(getattr(self.config.perturb, "model_eval_enabled", C.MODEL_EVAL_ENABLED)):
+            return False
+        return evaluation_due(
+            last_date=self.model_eval_date,
+            hour_utc=int(getattr(self.config.perturb, "model_eval_hour_utc", C.MODEL_EVAL_HOUR_UTC)),
+        )
+
+    def _build_model_evaluator(self) -> ModelEvaluator:
+        cfg = self.config.perturb
+        timeout_seconds = float(getattr(cfg, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS))
+        commitments_url = str(getattr(cfg, "model_commitments_api_url", C.MODEL_COMMITMENTS_API_URL))
+        evaluator_config = ModelEvaluatorConfig(
+            netuid=int(self.config.netuid),
+            commitments_api_url=commitments_url,
+            adv_dataset=str(getattr(cfg, "model_eval_adv_dataset", C.MODEL_EVAL_ADV_DATASET)),
+            adv_max_rows=int(getattr(cfg, "model_eval_adv_max_rows", C.MODEL_EVAL_ADV_MAX_ROWS)),
+            imagenet_repo_id=str(getattr(cfg, "imagenet1k_repo_id", C.IMAGENET1K_REPO_ID)),
+            imagenet_split=C.IMAGENET1K_VALIDATION_SPLIT,
+            imagenet_samples=int(getattr(cfg, "model_eval_imagenet_samples", C.MODEL_EVAL_IMAGENET_SAMPLES)),
+            batch_size=int(getattr(cfg, "model_eval_batch_size", C.MODEL_EVAL_BATCH_SIZE)),
+            imagenet_weight=float(getattr(cfg, "model_eval_imagenet_weight", C.MODEL_EVAL_IMAGENET_WEIGHT)),
+            adv_weight=float(getattr(cfg, "model_eval_adv_weight", C.MODEL_EVAL_ADV_WEIGHT)),
+            group_epsilon=float(getattr(cfg, "model_eval_group_epsilon", C.MODEL_EVAL_GROUP_EPSILON)),
+            must_beat_baseline=bool(getattr(cfg, "model_eval_must_beat_baseline", C.MODEL_EVAL_MUST_BEAT_BASELINE)),
+            imagenet_floor=float(getattr(cfg, "model_eval_imagenet_floor", C.MODEL_EVAL_IMAGENET_FLOOR)),
+            hf_token=str(getattr(cfg, "hf_token", C.HF_TOKEN)),
+            api_timeout_seconds=timeout_seconds,
+            max_model_bytes=int(getattr(cfg, "model_eval_max_model_bytes", C.MODEL_EVAL_MAX_MODEL_BYTES)),
+        )
+        netuid = int(self.config.netuid)
+        return ModelEvaluator(
+            evaluator_config,
+            reference_model=self.model,
+            device=self.device,
+            fetch_api_commitments=lambda: get_previous_commitments(url=commitments_url, timeout_seconds=timeout_seconds),
+            fetch_chain_commitments=lambda: self.subtensor.get_all_commitments(netuid),
+        )
+
+    def run_model_evaluation(self) -> ModelEvaluationOutcome | None:
+        date = evaluation_date()
+        self._log_step_start("model_evaluation", date=date)
+        try:
+            block = int(self.subtensor.get_current_block())
+            outcome = self._build_model_evaluator().run(date=date, block=block, hotkeys=list(self.metagraph.hotkeys))
+        except EvaluationDataUnavailable as exc:
+            self.model_eval_date = date
+            self._save_state()
+            logger.warning(f"Model evaluation skipped date={date}; keeping previous winner until the next daily run: {exc}")
+            return None
+        except Exception as exc:
+            self.model_eval_date = date
+            self._save_state()
+            logger.error(f"Model evaluation failed date={date}; keeping previous winner until the next daily run: {exc}")
+            return None
+
+        self.model_eval_date = date
+        self.model_winner_uid = outcome.winner_uid
+        self.model_winner_hotkey = (
+            str(self.metagraph.hotkeys[outcome.winner_uid]) if outcome.winner_uid is not None else ""
+        )
+        self._save_state()
+        self._report_model_evaluation(outcome)
+        return outcome
+
+    def _report_model_evaluation(self, outcome: ModelEvaluationOutcome) -> None:
+        if not bool(getattr(self.config.perturb, "leaderboard_reporting_enabled", True)):
+            return
+        url = str(getattr(self.config.perturb, "model_evaluation_report_api_url", C.MODEL_EVALUATION_REPORT_API_URL))
+        try:
+            post_model_evaluation(
+                url=url,
+                wallet=self.wallet,
+                api_key=self._api_key(),
+                payload=outcome.to_payload(),
+                timeout_seconds=float(getattr(self.config.perturb, "leaderboard_report_timeout_seconds", 10.0)),
+            )
+            network = outcome.network_payload()
+            logger.info(
+                f"Model evaluation report succeeded date={outcome.date} block={outcome.block} "
+                f"success_count={network['success_count']} avg_score={network['avg_score']:.4f}"
+            )
+        except Exception as exc:
+            logger.warning(f"Model evaluation report failed date={outcome.date}: {exc}")
+
+    def _fetch_consensus_model_winner(self) -> tuple[int | None, list[int], int]:
+        """Stake-weighted winner across every validator's latest evaluation report.
+        Returns (winner uid, top group, number of reports used)."""
+        url = str(getattr(self.config.perturb, "model_evaluation_report_api_url", C.MODEL_EVALUATION_REPORT_API_URL))
+        timeout_seconds = float(getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS))
+        max_age_days = int(getattr(self.config.perturb, "model_eval_consensus_max_age_days", C.MODEL_EVAL_CONSENSUS_MAX_AGE_DAYS))
+        oldest = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).strftime("%Y-%m-%d")
+        reports: list[tuple[float, ValidatorEvaluationReport]] = []
+        for hotkey, stake in self._validators_with_stake():
+            if stake <= 0.0:
+                continue
+            try:
+                payload = get_model_evaluation_report(url=url, validator_hotkey=hotkey, timeout_seconds=timeout_seconds)
+            except Exception as exc:
+                logger.debug(f"Model evaluation report unavailable validator={hotkey}: {exc}")
+                continue
+            report = ValidatorEvaluationReport.from_payload(payload, validator_hotkey=hotkey)
+            if report is None or (report.date and report.date < oldest):
+                continue
+            reports.append((stake, report))
+        winner, group, _ = consensus_model_winner(
+            reports,
+            epsilon=float(getattr(self.config.perturb, "model_eval_group_epsilon", C.MODEL_EVAL_GROUP_EPSILON)),
+            must_beat_baseline=bool(getattr(self.config.perturb, "model_eval_must_beat_baseline", C.MODEL_EVAL_MUST_BEAT_BASELINE)),
+            imagenet_floor=float(getattr(self.config.perturb, "model_eval_imagenet_floor", C.MODEL_EVAL_IMAGENET_FLOOR)),
+        )
+        return winner, group, len(reports)
+
+    def _model_winner_for_weights(self, *, burn_uid: int) -> int | None:
+        winner, group, used = self._fetch_consensus_model_winner()
+        if used == 0:
+            winner = self.model_winner_uid
+            logger.info(f"Model consensus unavailable; using local winner={winner if winner is not None else 'none'}")
+        else:
+            logger.info(f"Consensus model winner gathered validators={used} top_group={group or 'none'} winner={winner if winner is not None else 'none'} (stake-weighted)")
+        if winner is None or int(winner) == burn_uid or not (0 <= int(winner) < int(self.metagraph.n)):
+            return None
+        return int(winner)
+
+    # ------------------------------------------------------------------ weights
+
     def _set_weights(self, *, block: int) -> bool:
         self._log_step_start("set_weights")
         burn_uid = int(getattr(self.config.perturb, "burn_uid", 0))
@@ -711,8 +881,9 @@ class PerturbValidator:
         # payload (short-history miners report avg_score=0), so no local
         # history checks are needed here.
         consensus_scores = self._fetch_consensus_avg_scores()
-        if not consensus_scores:
-            logger.warning("No consensus scores available from leaderboard API; skipping weight setting.")
+        model_winner = self._model_winner_for_weights(burn_uid=burn_uid)
+        if not consensus_scores and model_winner is None:
+            logger.warning("No consensus scores available from leaderboard API and no model winner; skipping weight setting.")
             return False
 
         eligible = [
@@ -720,7 +891,7 @@ class PerturbValidator:
             for uid, score in consensus_scores.items()
             if uid != burn_uid and 0 <= uid < int(self.metagraph.n)
         ]
-        if not eligible:
+        if not eligible and model_winner is None:
             logger.warning("Consensus contains no scorable miners; skipping weight setting.")
             return False
 
@@ -729,11 +900,16 @@ class PerturbValidator:
         n_eligible = len(eligible)
         emission_raw = np.zeros(int(self.metagraph.n), dtype=np.float32)
 
-        # Only miners with positive average score may receive non-zero emissions.
         positive_eligible = [(uid, avg_score) for uid, avg_score in eligible if avg_score > 0.0]
         positive_uids = [uid for uid, _ in positive_eligible]
-        if not positive_uids:
-            logger.warning("No miners with positive average score; routing 100% to burn UID.")
+        track_weights = blend_track_weights(
+            scanning_shares=ranked_emission_shares(positive_uids),
+            model_winner_uid=model_winner,
+            scanning_share=float(getattr(self.config.perturb, "scanning_emission_share", C.SCANNING_EMISSION_SHARE)),
+            model_share=float(getattr(self.config.perturb, "model_emission_share", C.MODEL_EMISSION_SHARE)),
+        )
+        if not track_weights:
+            logger.warning("No miners with positive average score and no model winner; routing 100% to burn UID.")
             zero_weights = np.zeros(int(self.metagraph.n), dtype=np.float32)
             if len(zero_weights) > burn_uid:
                 zero_weights[burn_uid] = 1.0
@@ -750,20 +926,19 @@ class PerturbValidator:
                 logger.info("set_weights success (all zero)")
                 self.leaderboard_reporter.submit_last_weight_update(last_weight_update=block)
             else:
-                logger.error(f"set_weights failed (all zero): {msg}")
+                logger.error(f"set_weights failed (all zero): {_set_weights_failure(msg)}")
             return bool(ok)
 
-        # Ranks 4-10 split the final 5% by descending rank weight, not evenly.
         for uid, share in ranked_emission_shares(positive_uids).items():
             emission_raw[uid] = float(share)
 
         normalized = np.zeros(int(self.metagraph.n), dtype=np.float32)
-        for uid in positive_uids:
-            normalized[uid] = float(emission_raw[uid])
+        for uid, weight in track_weights.items():
+            normalized[uid] = float(weight)
         for rank0, (uid, avg_score) in enumerate(eligible[:10]):
             rank = rank0 + 1
             logger.debug(
-                f"rank={rank} uid={uid} avg_score={avg_score:.6f} emission_raw={emission_raw[uid]:.6f} emission={normalized[uid]:.6f}"
+                f"rank={rank} uid={uid} avg_score={avg_score:.6f} scanning_share={emission_raw[uid]:.6f} weight={normalized[uid]:.6f}"
             )
         top_weight_items: list[str] = []
         for rank, (uid, avg_score) in enumerate(positive_eligible[:5], start=1):
@@ -773,7 +948,10 @@ class PerturbValidator:
             burn=f"{burn_rate:.4f}",
             burn_uid=burn_uid,
             eligible=n_eligible,
-            distributed=len(positive_eligible),
+            distributed=len(track_weights),
+            model_winner=(
+                f"uid{model_winner}:w={normalized[model_winner]:.4f}" if model_winner is not None else "none"
+            ),
             top="|".join(top_weight_items) if top_weight_items else "none",
         )
 
@@ -800,7 +978,7 @@ class PerturbValidator:
             logger.info("set_weights success")
             self.leaderboard_reporter.submit_last_weight_update(last_weight_update=block)
         else:
-            logger.error(f"set_weights failed: {msg}")
+            logger.error(f"set_weights failed: {_set_weights_failure(msg)}")
         return bool(ok)
 
     def run(self) -> None:
@@ -822,6 +1000,16 @@ class PerturbValidator:
             perturb_weight=C.PERTURBATION_WEIGHT,
             tempo=tempo,
             run_id=self.run_id,
+            model_eval=(
+                f"enabled@{int(getattr(self.config.perturb, 'model_eval_hour_utc', C.MODEL_EVAL_HOUR_UTC)):02d}:00Z"
+                if getattr(self.config.perturb, "model_eval_enabled", C.MODEL_EVAL_ENABLED)
+                else "disabled"
+            ),
+            emission_split=(
+                f"scanning={float(getattr(self.config.perturb, 'scanning_emission_share', C.SCANNING_EMISSION_SHARE)):.2f}"
+                f"/model={float(getattr(self.config.perturb, 'model_emission_share', C.MODEL_EMISSION_SHARE)):.2f}"
+            ),
+            model_winner=self.model_winner_uid if self.model_winner_uid is not None else "none",
         )
 
         while True:
@@ -832,6 +1020,9 @@ class PerturbValidator:
                 block = self.subtensor.get_current_block()
                 self._log_step_start("loop_wait_task_boundary", block=block)
                 self._wait_for_next_task_boundary()
+                if self._model_evaluation_due():
+                    self.run_model_evaluation()
+                    continue
                 self._log_step_start("loop_wait_before_task_fetch", block=block)
                 self._wait_before_task_fetch()
                 self._log_step_start("loop_get_api_task", block=block)
