@@ -412,27 +412,32 @@ def _parse_created_at(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _rows_from_dataset(
-    dataset: Any, rows: list[RawAdvRow], *, since: datetime | None = None, until: datetime | None = None
-) -> int:
-    """Appends (clean, adversarial[], image_id) rows; returns how many were skipped by the created_at window."""
-    from datasets import Image
+ADV_COLUMNS = ("image_id", "created_at", "image", "adversarial")
 
-    dataset = dataset.cast_column("image", Image(decode=False))
-    container = dataset.features["adversarial"]
-    if hasattr(container, "feature"):
-        dataset = dataset.cast_column("adversarial", type(container)(Image(decode=False)))
+
+def _rows_from_parquet(
+    path: Path, rows: list[RawAdvRow], *, since: datetime | None = None, until: datetime | None = None
+) -> int:
+    """Appends (clean, adversarial[], image_id) rows from one shard; returns how many rows the
+    created_at window skipped. Reads the parquet directly so shards with different column sets
+    (e.g. written before/after a schema change) can be mixed."""
+    import pyarrow.parquet as pq
+
+    schema_names = set(pq.read_schema(path).names)
+    columns = [name for name in ADV_COLUMNS if name in schema_names]
+    table = pq.read_table(path, columns=columns)
     skipped = 0
-    for example in dataset:
-        if since is not None or until is not None:
-            created = _parse_created_at(example.get("created_at"))
-            if created is None or (since is not None and created < since) or (until is not None and created >= until):
-                skipped += 1
-                continue
-        clean = _image_bytes(example.get("image"))
-        adversarial = [b for b in (_image_bytes(v) for v in (example.get("adversarial") or [])) if b]
-        if clean and adversarial:
-            rows.append((clean, adversarial, str(example.get("image_id") or len(rows))))
+    for batch in table.to_batches():
+        for example in batch.to_pylist():
+            if since is not None or until is not None:
+                created = _parse_created_at(example.get("created_at"))
+                if created is None or (since is not None and created < since) or (until is not None and created >= until):
+                    skipped += 1
+                    continue
+            clean = _image_bytes(example.get("image"))
+            adversarial = [b for b in (_image_bytes(v) for v in (example.get("adversarial") or [])) if b]
+            if clean and adversarial:
+                rows.append((clean, adversarial, str(example.get("image_id") or len(rows))))
     return skipped
 
 
@@ -471,8 +476,7 @@ def load_adversarial_window(
     cache_dir: str | None = None,
 ) -> list[RawAdvRow]:
     """Rows of `repo_id` (at `revision`) whose task was created in [since, until)."""
-    from datasets import load_dataset
-    from huggingface_hub import HfApi
+    from huggingface_hub import HfApi, hf_hub_download
 
     files = HfApi(token=token or None).list_repo_files(repo_id, repo_type="dataset", revision=revision)
     # Shards published after `until` are still candidates: a row created at 23:50 may be
@@ -480,11 +484,11 @@ def load_adversarial_window(
     shards = window_shards(files, since=since, until=until + timedelta(days=1))
     rows: list[RawAdvRow] = []
     skipped = 0
-    if shards:
-        dataset = load_dataset(
-            repo_id, data_files={"window": shards}, split="window", revision=revision, token=token or None, cache_dir=cache_dir
+    for shard in shards:
+        local = hf_hub_download(
+            repo_id, shard, repo_type="dataset", revision=revision, token=token or None, cache_dir=cache_dir
         )
-        skipped = _rows_from_dataset(dataset, rows, since=since, until=until)
+        skipped += _rows_from_parquet(Path(local), rows, since=since, until=until)
     logger.info(
         f"Adversarial window repo={repo_id} created {since:%Y-%m-%dT%H:%MZ} -> {until:%Y-%m-%dT%H:%MZ}: "
         f"shards={len(shards)} rows={len(rows)} outside_window={skipped}"
