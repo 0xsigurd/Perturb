@@ -2,20 +2,20 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import io
 import json
 import os
 import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Sequence
 
 import torch
 
 from perturbnet import constants as C
 from perturbnet.api_client import post_task
 from perturbnet.image_io import decode_image_b64
+from perturbnet.imagenet1k import ImageNet1kRows
 from perturbnet.model import load_efficientnet_v2_l, normalize_prediction_label, predict_label
 from perturbnet.storage_uploader import ImageStorageUploader
 
@@ -29,17 +29,30 @@ class GeneratedTask:
 
 
 class TaskGenerator:
-    def __init__(self, *, state_path: str | os.PathLike[str] = "task_generator_state.json") -> None:
+    """Walks the ImageNet-1k train split in a persisted random order.
+
+    Rows are fetched one at a time through the datasets-server API
+    (`ImageNet1kRows`), so no local dataset download is needed. The traversal
+    order is a seeded permutation of row indices; seed/cursor live in the state
+    file so restarts continue where they left off and no image repeats within
+    an epoch of the permutation.
+    """
+
+    def __init__(
+        self,
+        *,
+        state_path: str | os.PathLike[str] = "task_generator_state.json",
+        rows: ImageNet1kRows | None = None,
+    ) -> None:
         self.state_path = Path(state_path)
         self.system_random = random.SystemRandom()
         self.order_seed = 0
         self.order_cursor = 0
         self.order_fingerprint = ""
         self.order_epoch = 0
-        self._order_cache: list[str] = []
+        self._order_cache: list[int] = []
         self._order_cache_key: tuple[str, int] = ("", 0)
-        self._dataset: Any | None = None
-        self._index: list[tuple[str, int]] = []
+        self.rows = rows or ImageNet1kRows(timeout_seconds=C.PERTURB_API_TIMEOUT_SECONDS * 3)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = load_efficientnet_v2_l(self.device)
         self._load_state()
@@ -68,25 +81,10 @@ class TaskGenerator:
         tmp_path.write_text(json.dumps(payload), encoding="utf-8")
         os.replace(tmp_path, self.state_path)
 
-    def _load_index(self) -> list[tuple[str, int]]:
-        if self._index:
-            return self._index
-        from perturbnet.imagenet100_bootstrap import imagenet100_dataset_version, load_imagenet100
-
-        dataset = load_imagenet100(repo_id=C.IMAGENET100_REPO_ID, split=C.IMAGENET100_SPLIT)
-        version = imagenet100_dataset_version(dataset=dataset, repo_id=C.IMAGENET100_REPO_ID, split=C.IMAGENET100_SPLIT)
-        total_rows = int(dataset.num_rows)
-        if total_rows <= 0:
-            raise RuntimeError("ImageNet-100 dataset is empty.")
-        self._dataset = dataset
-        self._index = [(f"hf-{version}-{row:07d}", row) for row in range(total_rows)]
-        return self._index
-
-    def _fingerprint(self, image_ids: Sequence[str]) -> str:
+    def _fingerprint(self) -> str:
+        """Identifies the dataset snapshot the persisted order belongs to."""
         digest = hashlib.sha256()
-        for image_id in sorted(image_ids):
-            digest.update(image_id.encode("utf-8"))
-            digest.update(b"\0")
+        digest.update(f"{self.rows.repo_id}:{self.rows.split}:{self.rows.num_rows}".encode("utf-8"))
         return digest.hexdigest()
 
     def _reset_order(self, *, fingerprint: str, epoch: int) -> None:
@@ -97,41 +95,31 @@ class TaskGenerator:
         self._order_cache = []
         self._order_cache_key = ("", 0)
 
-    def _ensure_order(self, image_ids: Sequence[str]) -> None:
-        fingerprint = self._fingerprint(image_ids)
+    def _ensure_order(self) -> None:
+        total_rows = int(self.rows.num_rows)
+        if total_rows <= 0:
+            raise RuntimeError(f"{self.rows.repo_id}:{self.rows.split} is empty.")
+        fingerprint = self._fingerprint()
         if self.order_fingerprint != fingerprint or self.order_seed <= 0:
             self._reset_order(fingerprint=fingerprint, epoch=0)
-        elif self.order_cursor >= len(image_ids):
+        elif self.order_cursor >= total_rows:
             self._reset_order(fingerprint=fingerprint, epoch=self.order_epoch + 1)
 
         cache_key = (self.order_fingerprint, int(self.order_seed))
         if self._order_cache_key != cache_key or not self._order_cache:
-            order = sorted(image_ids)
+            order = list(range(total_rows))
             random.Random(int(self.order_seed)).shuffle(order)
             self._order_cache = order
             self._order_cache_key = cache_key
 
-    def _image_bytes(self, row: int) -> bytes:
-        if self._dataset is None:
-            raise RuntimeError("ImageNet-100 dataset is not loaded.")
-        example = self._dataset[int(row)]
-        image = example.get("image")
-        if image is None:
-            raise ValueError(f"ImageNet-100 row {row} has no image payload.")
-        buffer = io.BytesIO()
-        image.convert("RGB").save(buffer, format="JPEG", quality=95)
-        return buffer.getvalue()
-
     def _sample_image(self) -> tuple[str, str]:
-        index = self._load_index()
-        source_by_id = {image_id: source for image_id, source in index}
-        image_ids = list(source_by_id.keys())
-        self._ensure_order(image_ids)
-        image_id = self._order_cache[self.order_cursor]
-        raw = self._image_bytes(source_by_id[image_id])
+        self._ensure_order()
+        row = self._order_cache[self.order_cursor]
+        fetched = self.rows.fetch(row)
+        image_id = f"hf-{self.rows.version()}-{row:07d}"
         self.order_cursor += 1
         self._save_state()
-        return image_id, base64.b64encode(raw).decode("utf-8")
+        return image_id, base64.b64encode(fetched.image_bytes).decode("utf-8")
 
     def generate(self) -> tuple[str, str, str]:
         for _ in range(C.MAX_CHALLENGE_ATTEMPTS):

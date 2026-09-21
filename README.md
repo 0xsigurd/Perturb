@@ -17,28 +17,34 @@ This repository provides:
 
 - validator node implementation (`neurons/validator.py`)
 - baseline miner implementation (`neurons/miner.py`)
+- miner model-track scripts: fine-tune, evaluate and submit an adversarially trained EfficientNetV2-L (`training/`)
 - one-command launchers for validator and miner
+
+Miners are rewarded on two tracks, both scored by validators:
+
+- **Adversarial scanning (80% of miner emissions)**: every two minutes, find an imperceptible perturbation of the current task image that flips EfficientNetV2-L's prediction.
+- **Adversarial training (20% of miner emissions)**: commit a fine-tuned EfficientNetV2-L on-chain; once a day validators evaluate every committed model on ImageNet-1k and the latest adversarial dataset, and the best model of the day takes the whole model share.
 
 ## Architecture
 
 ### Validator responsibilities
 
-- Sample challenge images from the full ImageNet-100 train split (~126k images, auto-downloaded)
-- Run fixed classifier (`EfficientNetV2-L`) on pulled image
-- Build and broadcast `AttackChallenge` synapse to selected miners
-- Verify miner responses and compute rewards
-- Maintain rolling histories and set on-chain weights periodically
+- Fetch the current task image (an ImageNet-1k training image published by the task generator) and run the fixed classifier (`EfficientNetV2-L`) on it
+- Verify every submitted miner image and compute scanning rewards
+- Once a day (00:00 UTC), evaluate all committed miner models and pick the day's model winner
+- Report scanning results and model evaluations to the API; set on-chain weights once per epoch from the cross-validator consensus
 
 ### Miner responsibilities
 
 - Poll the task API for the current task
 - Run baseline PGD-style attack
 - Upload the perturbed image and submit its URL
+- Optionally, fine-tune EfficientNetV2-L with `training/train.py` and publish it with `training/submit.py`
 - Let validator handle all authoritative verification and scoring
 
 ### Challenge lifecycle
 
-1. The team task generator samples an ImageNet-100 image and publishes one API task
+1. The team task generator samples an ImageNet-1k train image and publishes one API task
 2. Miners poll the task API, perturb the task image, upload the result, and submit the image URL
 3. Validators read submitted miner images from the API
 4. Validators score responses and report the full miner results
@@ -96,7 +102,7 @@ macOS (Homebrew):
 brew install node
 node --version
 npm --version
-bash ./scripts/setup_common.sh validator
+bash ./scripts/setup_common.sh
 ```
 
 Ubuntu/Debian:
@@ -106,7 +112,7 @@ sudo apt-get update
 sudo apt-get install -y nodejs npm
 node --version
 npm --version
-bash ./scripts/setup_common.sh validator
+bash ./scripts/setup_common.sh
 ```
 
 ## Installation and Setup (Validator Side)
@@ -126,11 +132,13 @@ Edit required fields in `scripts/validator.env`:
 - `WALLET_NAME`
 - `WALLET_HOTKEY`
 - `PERTURB_API_KEY`
+- `HF_TOKEN`: a Hugging Face token whose account has accepted the terms of the gated [`ILSVRC/imagenet-1k`](https://huggingface.co/datasets/ILSVRC/imagenet-1k) dataset. The daily model evaluation streams ImageNet-1k validation samples with it; `python scripts/check_imagenet1k.py` verifies access.
 
 Optional:
 
 - `PERTURB_API_BASE_URL`
 - `LOG_LEVEL` (`DEBUG` default, set `INFO`/`WARNING`/`ERROR` for quieter logs)
+- `PERTURB_MODEL_EVAL_*` (see *Adversarial training track* below)
 
 ### 2) Start validator
 
@@ -143,6 +151,7 @@ Expected log behavior:
 - API task polling messages
 - submitted response scoring logs
 - per-miner score logs
+- once a day, `model_evaluation date=...` followed by one `Model evaluated uid=...` line per committed model and a `model_evaluation_summary`
 - periodic `set_weights` attempts
 
 ### 3) Validator-side notes
@@ -173,7 +182,6 @@ Optional:
 
 - `PYTHON_BIN`
 - `LOG_LEVEL` (`DEBUG` default, set `INFO`/`WARNING`/`ERROR` if you want quieter logs)
-- `PERTURB_API_BASE_URL`
 - Storage credentials (`PERTURB_STORAGE_BACKEND`, `PERTURB_STORAGE_BUCKET`, `PERTURB_STORAGE_ACCESS_KEY_ID`, `PERTURB_STORAGE_SECRET_ACCESS_KEY`; Hippius is default, R2 is supported)
 - `MINER_EXTRA_ARGS`
 
@@ -198,7 +206,7 @@ Expected log behavior:
 
 Task generation is run separately by the team through `generate_and_publish_task(...)`.
 
-The generator samples ImageNet-100, uploads the clean task image with the configured storage settings, and publishes the current API task with the provided hotkeys. Hippius is the default storage backend; set `PERTURB_STORAGE_BACKEND="r2"` to use R2.
+The generator samples the ImageNet-1k train split (1.28M images), uploads the clean task image with the configured storage settings, and publishes the current API task with the provided hotkeys. Rows are fetched one at a time through the Hugging Face datasets-server API, so the 150 GB split is never downloaded; `HF_TOKEN` in `task_generator/task_generator.env` must have accepted the ImageNet-1k terms. The traversal is a persisted random permutation of row indices (`task_generator_state.json`), so no image repeats until the whole split has been used. Hippius is the default storage backend; set `PERTURB_STORAGE_BACKEND="r2"` to use R2.
 
 ## API and Protocol Contracts
 
@@ -211,7 +219,7 @@ The generator samples ImageNet-100, uploads the clean task image with the config
 
 ### Task generator
 
-Task generation is separated from validator runtime under `task_generator/`. It samples ImageNet-100, uploads the clean task image, and overwrites the current task row through the API.
+Task generation is separated from validator runtime under `task_generator/`. It samples ImageNet-1k, uploads the clean task image, and overwrites the current task row through the API.
 
 ### Leaderboard reporting
 
@@ -249,8 +257,11 @@ Weight setting:
 - At weight-setting time, the validator fetches every validator's leaderboard report from `GET /leaderboard/<validator_hotkey>` and computes a stake-weighted average of each miner's `avgScore` across all reporting validators (a validator's report counts proportionally to its stake). These consensus averages are the only input to weight setting; validators whose leaderboard fetch fails are skipped. If no consensus data is available at all, weight setting is skipped for that cycle.
 - Validators are identified by validator permit plus a minimum stake of `10,000`.
 - History gating happens at reporting time, not weight-setting time: a miner's reported `avgScore` averages over `min(PERTURB_HISTORY_SIZE, longest miner history)` records and is `0` until the miner reaches that window (or until any miner reaches `PERTURB_MIN_WEIGHT_HISTORY_SIZE`, default `50`).
-- Emission schedule: rank 1 receives `70%`, rank 2 receives `15%`, rank 3 receives `10%`, and the remaining `5%` is split by descending rank weight among positive-score miners ranked 4 through 10; miners ranked below 10 receive no emission share
+- Scanning emission schedule: rank 1 receives `75%`, rank 2 receives `20%`, rank 3 receives `5%`; every other miner receives no scanning share (with one or two positive miners the missing ranks roll up to the last one present).
+- Track blend: `miner weights = PERTURB_SCANNING_EMISSION_SHARE (0.8) x scanning shares + PERTURB_MODEL_EMISSION_SHARE (0.2) x {model winner: 1}`. Both inputs are stake-weighted consensus values across validators (scanning: leaderboard `avg_score`s; model: `overall` scores from the evaluation reports, then the same epsilon-group / earliest-block rule). A uid that leads both tracks receives `0.8 x 0.75 + 0.2 = 0.8` of the miner allocation. Without a model winner the model share is not awarded and scanning receives the whole miner allocation; without any positive scanning miner the model winner receives it.
 - At each weight-setting cycle, the validator fetches `burnRate` from the burn endpoint configured in `perturbnet/constants.py` and assigns that share to the configured burn UID. Miner weights are scaled by `1 - burnRate`, keeping the submitted vector normalized. If the API is unavailable or invalid, the default burn rate from `constants.py` is used instead.
+
+
 
 ## Integration Smoke Test
 
@@ -267,7 +278,8 @@ The smoke test validates:
 
 ## Troubleshooting
 
-- Validator cannot generate challenges: verify internet access to Hugging Face for the first dataset download.
+- `datasets-server HTTP 401/403/404 ... gated dataset`: `HF_TOKEN` is missing or its account has not accepted the ImageNet-1k terms; run `python scripts/check_imagenet1k.py`.
+- `Model evaluation failed ...`: the commitments API, the adversarial dataset or ImageNet-1k was unreachable; the previous winner stays in place until the next daily run (no retry).
 - No miner scoring activity: ensure miner hotkeys are registered and publicly reachable.
 - Dependency install issues: install CUDA/CPU-specific PyTorch build compatible with your host.
 
@@ -281,11 +293,15 @@ Use `docs/READINESS_CHECKLIST.md` before long-run validation or deployment.
 - `neurons/miner.py`: baseline miner logic and Axon serving
 - `perturbnet/protocol.py`: `AttackChallenge` synapse schema
 - `perturbnet/model.py`: EfficientNet model load and label prediction helpers
+- `perturbnet/model_commit.py`: on-chain model commitment schema and `sha256(model || hotkey)` (shared by validator and `training/submit.py`)
+- `perturbnet/model_evaluation.py`: daily model evaluation (commitment verification, evaluation data, scoring, winner selection)
+- `perturbnet/emissions.py`: 75/20/5 scanning schedule and the scanning/model track blend
+- `perturbnet/imagenet1k.py`: row-level ImageNet-1k access through the datasets-server API (task generator)
 - `perturbnet/image_io.py`: base64 image encode/decode helpers
-- `perturbnet/imagenet100_bootstrap.py`: ImageNet-100 full-split download/open helpers
+- `training/`: miner scripts for the adversarial training track (`train.py`, `evaluate.py`, `submit.py`)
 - `scripts/run_validator.sh`: start/restart validator with PM2
 - `scripts/run_miner.sh`: start/restart miner with PM2
-- `scripts/setup_common.sh`: role-aware bootstrap (PM2 + Python deps; `validator` also pre-downloads ImageNet-100)
-- `scripts/bootstrap_imagenet100.py`: manual ImageNet-100 pre-download CLI
+- `scripts/setup_common.sh`: role-aware bootstrap (PM2 + Python deps)
+- `scripts/check_imagenet1k.py`: verify `HF_TOKEN` can read ImageNet-1k
 - `scripts/integration_smoke_test.py`: local integration test
 
