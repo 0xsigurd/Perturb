@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import io
 import os
 import sys
 from pathlib import Path
@@ -10,16 +9,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 def main() -> int:
-    print("[1/3] Load ImageNet-100 challenge candidate")
-    from perturbnet.imagenet100_bootstrap import load_imagenet100
+    print("[1/3] Fetch an ImageNet-1k challenge candidate (datasets-server, needs HF_TOKEN)")
+    from perturbnet.imagenet1k import ImageNet1kRows
 
-    dataset = load_imagenet100()
-    example = dataset[0]
-    buffer = io.BytesIO()
-    example["image"].convert("RGB").save(buffer, format="JPEG", quality=95)
-    image_bytes = buffer.getvalue()
-    print(f"  dataset rows={int(dataset.num_rows)} sample=row 0")
-    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    rows = ImageNet1kRows()
+    fetched = rows.fetch(0)
+    print(f"  dataset rows={rows.num_rows} sample=row 0 label={fetched.label_name!r}")
+    image_b64 = base64.b64encode(fetched.image_bytes).decode("utf-8")
 
     print("[2/3] Run EfficientNetV2-L inference")
     import torch

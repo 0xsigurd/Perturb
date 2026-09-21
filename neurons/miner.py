@@ -74,6 +74,8 @@ def _configure_log_level(level_raw: str) -> None:
         format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     )
     pylogging.getLogger().setLevel(level)
+    for noisy in ("httpx", "httpcore", "huggingface_hub", "datasets", "filelock", "fsspec", "urllib3"):
+        pylogging.getLogger(noisy).setLevel(pylogging.WARNING)
 
 
 class PerturbMiner:

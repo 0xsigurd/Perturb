@@ -45,10 +45,14 @@ MODEL_NAME = "EfficientNetV2-L"
 VALIDATOR_STATE_FILENAME = "perturb_validator_state.json"
 
 # Validator runtime constants.
-# Challenge dataset is fixed: full ImageNet-100 train split from Hugging Face,
-# auto-downloaded once into the local cache.
-IMAGENET100_REPO_ID = "clane9/imagenet-100"
-IMAGENET100_SPLIT = "train"
+# Challenge images come from the ImageNet-1k train split on Hugging Face. The
+# task generator fetches single rows through the datasets-server API, so the
+# 150 GB split is never downloaded. The dataset is gated: HF_TOKEN must belong
+# to an account that accepted its terms.
+IMAGENET1K_REPO_ID = os.getenv("PERTURB_IMAGENET1K_REPO_ID", "ILSVRC/imagenet-1k").strip()
+IMAGENET1K_SPLIT = "train"
+IMAGENET1K_VALIDATION_SPLIT = "validation"
+HF_TOKEN = _env_first(("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"), "")
 # If challenge generation fails (e.g. transient dataset issue), sleep this
 # long and try again; there is no fallback image.
 CHALLENGE_RETRY_DELAY_SECONDS = _env_int("PERTURB_CHALLENGE_RETRY_DELAY_SECONDS", 180)
@@ -99,9 +103,51 @@ STORAGE_REGION = os.getenv("PERTURB_STORAGE_REGION", "").strip()
 STORAGE_PREFIX = "perturb"
 STORAGE_PRESIGNED_URL_EXPIRES_SECONDS = 604800
 
+SCANNING_EMISSION_SHARE = _env_float("PERTURB_SCANNING_EMISSION_SHARE", 0.8)
+MODEL_EMISSION_SHARE = _env_float("PERTURB_MODEL_EMISSION_SHARE", 0.2)
+MODEL_EVAL_ENABLED = _env_bool("PERTURB_MODEL_EVAL_ENABLED", True)
+MODEL_EVAL_HOUR_UTC = _env_int("PERTURB_MODEL_EVAL_HOUR_UTC", 0)
+MODEL_COMMITMENTS_API_URL = os.getenv(
+    "PERTURB_MODEL_COMMITMENTS_API_URL", "https://api.perturbai.io/training/commitments"
+).strip()
+MODEL_EVALUATION_REPORT_API_URL = os.getenv(
+    "PERTURB_MODEL_EVALUATION_REPORT_API_URL", "https://api.perturbai.io/training/evaluations"
+).strip()
+MODEL_EVAL_ADV_DATASET = os.getenv(
+    "PERTURB_MODEL_EVAL_ADV_DATASET", "perturb-ai/efficientnet-v2-l-adv-dataset"
+).strip()
+MODEL_EVAL_ADV_MAX_ROWS = _env_int("PERTURB_MODEL_EVAL_ADV_MAX_ROWS", 400)
+MODEL_EVAL_IMAGENET_SAMPLES = _env_int("PERTURB_MODEL_EVAL_IMAGENET_SAMPLES", 1000)
+MODEL_EVAL_BATCH_SIZE = _env_int("PERTURB_MODEL_EVAL_BATCH_SIZE", 16)
+MODEL_EVAL_IMAGENET_WEIGHT = _env_float("PERTURB_MODEL_EVAL_IMAGENET_WEIGHT", 0.5)
+MODEL_EVAL_ADV_WEIGHT = _env_float("PERTURB_MODEL_EVAL_ADV_WEIGHT", 0.5)
+MODEL_EVAL_GROUP_EPSILON = _env_float("PERTURB_MODEL_EVAL_GROUP_EPSILON", 0.005)
+MODEL_EVAL_MUST_BEAT_BASELINE = _env_bool("PERTURB_MODEL_EVAL_MUST_BEAT_BASELINE", True)
+MODEL_EVAL_IMAGENET_FLOOR = _env_float("PERTURB_MODEL_EVAL_IMAGENET_FLOOR", 0.02)
+MODEL_EVAL_MAX_MODEL_BYTES = _env_int("PERTURB_MODEL_EVAL_MAX_MODEL_BYTES", 2_000_000_000)
+MODEL_EVAL_CONSENSUS_MAX_AGE_DAYS = _env_int("PERTURB_MODEL_EVAL_CONSENSUS_MAX_AGE_DAYS", 2)
+
 VALIDATOR_CONFIG = {
-    "imagenet100_repo_id": IMAGENET100_REPO_ID,
-    "imagenet100_split": IMAGENET100_SPLIT,
+    "imagenet1k_repo_id": IMAGENET1K_REPO_ID,
+    "imagenet1k_split": IMAGENET1K_SPLIT,
+    "hf_token": HF_TOKEN,
+    "scanning_emission_share": SCANNING_EMISSION_SHARE,
+    "model_emission_share": MODEL_EMISSION_SHARE,
+    "model_eval_enabled": MODEL_EVAL_ENABLED,
+    "model_eval_hour_utc": MODEL_EVAL_HOUR_UTC,
+    "model_commitments_api_url": MODEL_COMMITMENTS_API_URL,
+    "model_evaluation_report_api_url": MODEL_EVALUATION_REPORT_API_URL,
+    "model_eval_adv_dataset": MODEL_EVAL_ADV_DATASET,
+    "model_eval_adv_max_rows": MODEL_EVAL_ADV_MAX_ROWS,
+    "model_eval_imagenet_samples": MODEL_EVAL_IMAGENET_SAMPLES,
+    "model_eval_batch_size": MODEL_EVAL_BATCH_SIZE,
+    "model_eval_imagenet_weight": MODEL_EVAL_IMAGENET_WEIGHT,
+    "model_eval_adv_weight": MODEL_EVAL_ADV_WEIGHT,
+    "model_eval_group_epsilon": MODEL_EVAL_GROUP_EPSILON,
+    "model_eval_must_beat_baseline": MODEL_EVAL_MUST_BEAT_BASELINE,
+    "model_eval_imagenet_floor": MODEL_EVAL_IMAGENET_FLOOR,
+    "model_eval_max_model_bytes": MODEL_EVAL_MAX_MODEL_BYTES,
+    "model_eval_consensus_max_age_days": MODEL_EVAL_CONSENSUS_MAX_AGE_DAYS,
     "image_size": IMAGE_SIZE,
     "k_miners": K_MINERS,
     "history_size": HISTORY_SIZE,

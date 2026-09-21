@@ -22,6 +22,13 @@ class SubmittedResponse:
     image_hash: str = ""
 
 
+@dataclass(frozen=True)
+class ApiCommitment:
+    miner_id: str
+    commitment: str
+    block: int
+
+
 def _url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
@@ -153,6 +160,51 @@ def get_leaderboard_avg_scores(
         if math.isfinite(avg_score):
             scores[uid] = avg_score
     return scores
+
+
+def get_previous_commitments(*, url: str, timeout_seconds: float) -> list[ApiCommitment]:
+    response = requests.get(url, timeout=timeout_seconds)
+    payload = _json_response(response)
+    if not isinstance(payload, list):
+        return []
+    commitments: list[ApiCommitment] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        try:
+            block = int(item.get("block"))
+        except (TypeError, ValueError):
+            continue
+        miner_id = str(item.get("miner_id", item.get("miner_uid", "")) or "").strip()
+        commitment = str(item.get("commitment") or "").strip()
+        if miner_id and commitment:
+            commitments.append(ApiCommitment(miner_id=miner_id, commitment=commitment, block=block))
+    return commitments
+
+
+def get_model_evaluation_report(*, url: str, validator_hotkey: str, timeout_seconds: float) -> Any:
+    response = requests.get(f"{url.rstrip('/')}/{validator_hotkey}", timeout=timeout_seconds)
+    return _json_response(response)
+
+
+def post_model_evaluation(
+    *,
+    url: str,
+    wallet: Any,
+    api_key: str,
+    payload: dict[str, Any],
+    timeout_seconds: float,
+) -> Any:
+    hotkey = str(getattr(getattr(wallet, "hotkey", None), "ss58_address", ""))
+    body = json.dumps({**payload, "validator_hotkey": hotkey, "timestamp": datetime.now(UTC).isoformat()}, separators=(",", ":")).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "X-Validator-Hotkey": hotkey,
+        "X-Signature": sign_body(wallet, body),
+        **_authorization_headers(api_key),
+    }
+    response = requests.post(url, data=body, headers=headers, timeout=timeout_seconds)
+    return _json_response(response)
 
 
 def get_submitted_responses(*, base_url: str, api_key: str, timeout_seconds: float) -> list[SubmittedResponse]:
