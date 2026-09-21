@@ -487,17 +487,20 @@ def load_adversarial_window(
     # Shards published after `until` are still candidates: a row created at 23:50 may be
     # uploaded at 00:10. The pinned revision bounds what is visible, created_at bounds the rows.
     shards = window_shards(files, since=since, until=until + timedelta(days=1))
+    logger.info(
+        f"Adversarial window repo={repo_id} created {since:%Y-%m-%dT%H:%MZ} -> {until:%Y-%m-%dT%H:%MZ}: "
+        f"reading {len(shards)} shard(s)"
+    )
     rows: list[RawAdvRow] = []
     skipped = 0
-    for shard in shards:
+    for index, shard in enumerate(shards, start=1):
         local = hf_hub_download(
             repo_id, shard, repo_type="dataset", revision=revision, token=token or None, cache_dir=cache_dir
         )
         skipped += _rows_from_parquet(Path(local), rows, since=since, until=until)
-    logger.info(
-        f"Adversarial window repo={repo_id} created {since:%Y-%m-%dT%H:%MZ} -> {until:%Y-%m-%dT%H:%MZ}: "
-        f"shards={len(shards)} rows={len(rows)} outside_window={skipped}"
-    )
+        if index % 10 == 0 or index == len(shards):
+            logger.info(f"  shard {index}/{len(shards)}: {len(rows)} rows in window")
+    logger.info(f"Adversarial window rows={len(rows)} outside_window={skipped}")
     return _subsample(rows, max_rows=max_rows, seed=seed)
 
 
@@ -517,11 +520,18 @@ def load_imagenet_samples(
     stream = stream.cast_column("image", Image(decode=False))
     stream = stream.shuffle(seed=int(seed), buffer_size=max(1000, int(samples))).take(int(samples))
     items: list[tuple[bytes, int]] = []
+    started = time.time()
     for example in stream:
         raw = _image_bytes(example.get("image"))
         label = example.get("label")
         if raw is not None and label is not None and int(label) >= 0:
             items.append((raw, int(label)))
+        if not items:
+            continue
+        if len(items) == 1:
+            logger.info(f"  first image after {time.time() - started:.0f}s")
+        elif len(items) % 250 == 0:
+            logger.info(f"  {len(items)}/{int(samples)} images")
     return items
 
 
@@ -539,6 +549,7 @@ def load_eval_data(
     token: str | None,
 ) -> EvalData:
     seed = day_seed(date)
+    started = time.time()
     day_start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     window_start = day_start - timedelta(days=1)
 
@@ -575,6 +586,7 @@ def load_eval_data(
             f"adversarial dataset {adv_repo_id} has no rows created between "
             f"{window_start:%Y-%m-%dT%H:%MZ} and {day_start:%Y-%m-%dT%H:%MZ}"
         )
+    logger.info(f"Labelling {len(raw_rows)} clean images with the reference model")
     reference_labels = predict_labels(
         reference_model, [(clean, 0) for clean, _, _ in raw_rows], device=device, batch_size=batch_size
     )
@@ -582,14 +594,16 @@ def load_eval_data(
         AdversarialRow(clean=clean, adversarial=adv, reference_label=label)
         for (clean, adv, _), label in zip(raw_rows, reference_labels)
     ]
+    logger.info(f"Streaming {imagenet_samples} {imagenet_repo_id}:{imagenet_split} images (first batch can take minutes)")
     imagenet = load_imagenet_samples(
         imagenet_repo_id, split=imagenet_split, samples=imagenet_samples, seed=seed, token=token
     )
     if imagenet_samples > 0 and not imagenet:
         raise RuntimeError(f"{imagenet_repo_id}:{imagenet_split} yielded no samples (HF_TOKEN / gated access?)")
-    logger.debug(
-        f"Model evaluation data ready date={date} imagenet={len(imagenet)} adv_rows={len(adversarial)} "
-        f"adv_images={sum(len(r.adversarial) for r in adversarial)} adv_source={adv_revision}"
+    logger.info(
+        f"Evaluation data ready in {time.time() - started:.0f}s: imagenet={len(imagenet)} "
+        f"adv_rows={len(adversarial)} adv_images={sum(len(r.adversarial) for r in adversarial)} "
+        f"adv_revision={adv_revision[:8]}"
     )
     return EvalData(imagenet=imagenet, adversarial=adversarial, adv_dataset_revision=adv_revision)
 
@@ -679,6 +693,10 @@ class ModelEvaluator:
 
     def candidates(self, hotkeys: Sequence[str]) -> list[ModelEvalResult]:
         api_rows = self.fetch_api_commitments()
+        if not api_rows:
+            # An empty snapshot is an upstream problem, not "every miner failed": treat it as
+            # missing data so the caller keeps the previous winner instead of clearing it.
+            raise EvaluationDataUnavailable(f"{self.config.commitments_api_url} returned no commitments")
         chain = self.fetch_chain_commitments()
         uid_by_hotkey = {str(hotkey): uid for uid, hotkey in enumerate(hotkeys)}
         by_uid: dict[int, ModelEvalResult] = {}
@@ -754,6 +772,23 @@ class ModelEvaluator:
             logger.info(
                 f"  miner_uid={result.uid} repo_id={result.repo_id} "
                 f"revision={result.revision[:5]} block={result.block}"
+            )
+
+        if not pending:
+            logger.info(f"No verifiable model commitments among {len(results)} submission(s); no model winner")
+            return ModelEvaluationOutcome(
+                date=date,
+                block=int(block),
+                winner_uid=None,
+                baseline=None,
+                results=results,
+                imagenet_samples=0,
+                adv_rows=0,
+                adv_images=0,
+                adv_dataset_revision="",
+                group_epsilon=cfg.group_epsilon,
+                duration_seconds=time.time() - started,
+                imagenet_floor=cfg.imagenet_floor,
             )
 
         logger.info("Preparing evaluation data")
