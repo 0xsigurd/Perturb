@@ -61,17 +61,18 @@ class ModelEvalResult:
 
     def to_payload(self) -> dict[str, Any]:
         return {
-            "miner_uid": int(self.uid),
+            "uid": int(self.uid),
             "hotkey": self.hotkey,
-            "commitment": self.commitment if self.repo_id else None,
-            "block": int(self.block),
+            "repoId": self.repo_id or None,
+            "revision": self.revision or None,
+            "commitBlock": int(self.block),
+            "score": round(float(self.overall), 6),
+            "robustAccuracy": round(float(self.adv_top1), 6),
+            "cleanAccuracy": round(float(self.imagenet_top1), 6),
+            "advCleanAccuracy": round(float(self.adv_clean_top1), 6),
             "valid": bool(self.valid),
             "reason": self.reason,
-            "imagenet_top1": round(float(self.imagenet_top1), 6),
-            "adv_top1": round(float(self.adv_top1), 6),
-            "adv_clean_top1": round(float(self.adv_clean_top1), 6),
-            "overall": round(float(self.overall), 6),
-            "eval_seconds": round(float(self.eval_seconds), 1),
+            "evalSeconds": round(float(self.eval_seconds), 1),
         }
 
 
@@ -82,7 +83,6 @@ class ModelEvaluationOutcome:
     winner_uid: int | None
     baseline: ModelEvalResult | None
     results: list[ModelEvalResult]
-    hotkeys: list[str]
     imagenet_samples: int
     adv_rows: int
     adv_images: int
@@ -111,18 +111,17 @@ class ModelEvaluationOutcome:
             "avg_adv_top1": mean("adv_top1"),
         }
 
-    def miners_payload(self) -> list[dict[str, Any]]:
-        by_uid = {int(r.uid): r for r in self.results}
-        rows: list[dict[str, Any]] = []
-        for uid, hotkey in enumerate(self.hotkeys):
-            result = by_uid.get(uid) or ModelEvalResult(
-                uid=uid, hotkey=str(hotkey), repo_id="", revision="", block=0, reason="no_commitment"
-            )
-            rows.append(result.to_payload())
-        return rows
+    def table_data(self) -> list[dict[str, Any]]:
+        """One record per miner that committed a model, ordered by uid."""
+        return [result.to_payload() for result in sorted(self.results, key=lambda r: int(r.uid))]
 
     def to_payload(self) -> dict[str, Any]:
+        network = self.network_payload()
         return {
+            "success_count": int(network["success_count"]),
+            "last_evaluation_block": int(self.block),
+            "avg_score": float(network["avg_score"]),
+            "table_data": self.table_data(),
             "date": self.date,
             "block": int(self.block),
             "winner_uid": None if self.winner_uid is None else int(self.winner_uid),
@@ -136,7 +135,6 @@ class ModelEvaluationOutcome:
             "adv_images": int(self.adv_images),
             "adv_dataset_revision": self.adv_dataset_revision,
             "duration_seconds": round(float(self.duration_seconds), 1),
-            "miners": self.miners_payload(),
         }
 
 
@@ -191,17 +189,24 @@ class ValidatorEvaluationReport:
     baseline_imagenet: float = 0.0
     imagenet: dict[int, float] = field(default_factory=dict)
 
+    @staticmethod
+    def _field(item: dict[str, Any], *names: str) -> Any:
+        for name in names:
+            if name in item:
+                return item[name]
+        return None
+
     @classmethod
     def from_payload(cls, payload: Any, *, validator_hotkey: str = "") -> "ValidatorEvaluationReport | None":
         if not isinstance(payload, dict):
             return None
-        miners = payload.get("miners", payload.get("models"))
+        miners = cls._field(payload, "table_data", "tableData", "miners", "models")
         if not isinstance(miners, list):
             return None
-        baseline = payload.get("baseline") or {}
+        baseline = payload.get("baseline") if isinstance(payload.get("baseline"), dict) else {}
         try:
-            baseline_overall = float(baseline.get("overall", 0.0)) if isinstance(baseline, dict) else 0.0
-            baseline_imagenet = float(baseline.get("imagenet_top1", 0.0)) if isinstance(baseline, dict) else 0.0
+            baseline_overall = float(cls._field(baseline, "score", "overall") or 0.0)
+            baseline_imagenet = float(cls._field(baseline, "cleanAccuracy", "clean_accuracy", "imagenet_top1") or 0.0)
         except (TypeError, ValueError):
             baseline_overall = 0.0
             baseline_imagenet = 0.0
@@ -212,26 +217,26 @@ class ValidatorEvaluationReport:
             if not isinstance(item, dict):
                 continue
             try:
-                uid = int(item.get("miner_uid", item.get("miner_id")))
+                uid = int(cls._field(item, "uid", "miner_uid", "miner_id"))
             except (TypeError, ValueError):
                 continue
-            if not bool(item.get("valid")):
+            if not bool(item.get("valid", True)):
                 continue
             try:
-                overall = float(item.get("overall", 0.0))
-                block = int(item.get("block", 0))
-                imagenet_top1 = float(item.get("imagenet_top1", 0.0))
+                overall = float(cls._field(item, "score", "overall") or 0.0)
+                block = int(cls._field(item, "commitBlock", "commit_block", "block") or 0)
+                imagenet_top1 = float(cls._field(item, "cleanAccuracy", "clean_accuracy", "imagenet_top1") or 0.0)
             except (TypeError, ValueError):
                 continue
             scores[uid] = overall
             blocks[uid] = block
             imagenet[uid] = imagenet_top1
         try:
-            block = int(payload.get("block", 0) or 0)
+            block = int(cls._field(payload, "last_evaluation_block", "lastEvaluationBlock", "block") or 0)
         except (TypeError, ValueError):
             block = 0
         return cls(
-            validator_hotkey=str(payload.get("validator_hotkey") or validator_hotkey),
+            validator_hotkey=str(cls._field(payload, "validator_hotkey", "validatorHotkey") or validator_hotkey),
             date=str(payload.get("date") or ""),
             block=block,
             baseline_overall=baseline_overall,
@@ -794,7 +799,6 @@ class ModelEvaluator:
             winner_uid=winner,
             baseline=baseline,
             results=results,
-            hotkeys=[str(h) for h in hotkeys],
             imagenet_samples=len(data.imagenet),
             adv_rows=len(data.adversarial),
             adv_images=data.adv_images,
