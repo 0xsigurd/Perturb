@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -65,22 +64,6 @@ def parse_chain_commit(data: str) -> MinerChainCommit | None:
     if not commit.hf_repo_id or not commit.hf_revision or not commit.model_hash:
         return None
     return commit
-
-
-@dataclass(frozen=True)
-class RepoRevision:
-    repo_id: str
-    revision: str
-
-    def __str__(self) -> str:
-        return f"{self.repo_id}@{self.revision}"
-
-
-def parse_repo_at_revision(text: str) -> RepoRevision | None:
-    repo_id, sep, revision = str(text or "").strip().partition("@")
-    if not sep or not repo_id or not revision or "/" not in repo_id:
-        return None
-    return RepoRevision(repo_id=repo_id, revision=revision)
 
 
 def sha256_file(path: str | os.PathLike[str]) -> str:

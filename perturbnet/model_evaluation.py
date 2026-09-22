@@ -26,7 +26,6 @@ from perturbnet.model_commit import (
     MODEL_HASH_CHARS,
     NUM_CLASSES,
     parse_chain_commit,
-    parse_repo_at_revision,
     sha256_model_and_hotkey,
 )
 
@@ -487,17 +486,20 @@ def load_adversarial_window(
     # Shards published after `until` are still candidates: a row created at 23:50 may be
     # uploaded at 00:10. The pinned revision bounds what is visible, created_at bounds the rows.
     shards = window_shards(files, since=since, until=until + timedelta(days=1))
+    logger.info(
+        f"Adversarial window repo={repo_id} created {since:%Y-%m-%dT%H:%MZ} -> {until:%Y-%m-%dT%H:%MZ}: "
+        f"reading {len(shards)} shard(s)"
+    )
     rows: list[RawAdvRow] = []
     skipped = 0
-    for shard in shards:
+    for index, shard in enumerate(shards, start=1):
         local = hf_hub_download(
             repo_id, shard, repo_type="dataset", revision=revision, token=token or None, cache_dir=cache_dir
         )
         skipped += _rows_from_parquet(Path(local), rows, since=since, until=until)
-    logger.info(
-        f"Adversarial window repo={repo_id} created {since:%Y-%m-%dT%H:%MZ} -> {until:%Y-%m-%dT%H:%MZ}: "
-        f"shards={len(shards)} rows={len(rows)} outside_window={skipped}"
-    )
+        if index % 10 == 0 or index == len(shards):
+            logger.info(f"  shard {index}/{len(shards)}: {len(rows)} rows in window")
+    logger.info(f"Adversarial window rows={len(rows)} outside_window={skipped}")
     return _subsample(rows, max_rows=max_rows, seed=seed)
 
 
@@ -517,11 +519,18 @@ def load_imagenet_samples(
     stream = stream.cast_column("image", Image(decode=False))
     stream = stream.shuffle(seed=int(seed), buffer_size=max(1000, int(samples))).take(int(samples))
     items: list[tuple[bytes, int]] = []
+    started = time.time()
     for example in stream:
         raw = _image_bytes(example.get("image"))
         label = example.get("label")
         if raw is not None and label is not None and int(label) >= 0:
             items.append((raw, int(label)))
+        if not items:
+            continue
+        if len(items) == 1:
+            logger.info(f"  first image after {time.time() - started:.0f}s")
+        elif len(items) % 250 == 0:
+            logger.info(f"  {len(items)}/{int(samples)} images")
     return items
 
 
@@ -539,6 +548,7 @@ def load_eval_data(
     token: str | None,
 ) -> EvalData:
     seed = day_seed(date)
+    started = time.time()
     day_start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     window_start = day_start - timedelta(days=1)
 
@@ -575,6 +585,7 @@ def load_eval_data(
             f"adversarial dataset {adv_repo_id} has no rows created between "
             f"{window_start:%Y-%m-%dT%H:%MZ} and {day_start:%Y-%m-%dT%H:%MZ}"
         )
+    logger.info(f"Labelling {len(raw_rows)} clean images with the reference model")
     reference_labels = predict_labels(
         reference_model, [(clean, 0) for clean, _, _ in raw_rows], device=device, batch_size=batch_size
     )
@@ -582,14 +593,16 @@ def load_eval_data(
         AdversarialRow(clean=clean, adversarial=adv, reference_label=label)
         for (clean, adv, _), label in zip(raw_rows, reference_labels)
     ]
+    logger.info(f"Streaming {imagenet_samples} {imagenet_repo_id}:{imagenet_split} images (first batch can take minutes)")
     imagenet = load_imagenet_samples(
         imagenet_repo_id, split=imagenet_split, samples=imagenet_samples, seed=seed, token=token
     )
     if imagenet_samples > 0 and not imagenet:
         raise RuntimeError(f"{imagenet_repo_id}:{imagenet_split} yielded no samples (HF_TOKEN / gated access?)")
-    logger.debug(
-        f"Model evaluation data ready date={date} imagenet={len(imagenet)} adv_rows={len(adversarial)} "
-        f"adv_images={sum(len(r.adversarial) for r in adversarial)} adv_source={adv_revision}"
+    logger.info(
+        f"Evaluation data ready in {time.time() - started:.0f}s: imagenet={len(imagenet)} "
+        f"adv_rows={len(adversarial)} adv_images={sum(len(r.adversarial) for r in adversarial)} "
+        f"adv_revision={adv_revision[:8]}"
     )
     return EvalData(imagenet=imagenet, adversarial=adversarial, adv_dataset_revision=adv_revision)
 
@@ -667,19 +680,20 @@ class ModelEvaluator:
         reference_model: torch.nn.Module,
         device: torch.device,
         fetch_api_commitments: Callable[[], list[ApiCommitment]],
-        fetch_chain_commitments: Callable[[], dict[str, str]],
     ) -> None:
         self.config = config
         self.reference_model = reference_model
         self.device = device
         self.fetch_api_commitments = fetch_api_commitments
-        self.fetch_chain_commitments = fetch_chain_commitments
 
     # ---- candidates -------------------------------------------------------
 
     def candidates(self, hotkeys: Sequence[str]) -> list[ModelEvalResult]:
         api_rows = self.fetch_api_commitments()
-        chain = self.fetch_chain_commitments()
+        if not api_rows:
+            # An empty snapshot is an upstream problem, not "every miner failed": treat it as
+            # missing data so the caller keeps the previous winner instead of clearing it.
+            raise EvaluationDataUnavailable(f"{self.config.commitments_api_url} returned no commitments")
         uid_by_hotkey = {str(hotkey): uid for uid, hotkey in enumerate(hotkeys)}
         by_uid: dict[int, ModelEvalResult] = {}
         for row in api_rows:
@@ -687,35 +701,24 @@ class ModelEvaluator:
             if uid is None or not (0 <= uid < len(hotkeys)):
                 logger.debug(f"Commitment row skipped: miner_id={row.miner_id!r} is not a registered uid/hotkey")
                 continue
-            parsed = parse_repo_at_revision(row.commitment)
+            commit = parse_chain_commit(row.commitment)
             result = ModelEvalResult(
                 uid=uid,
                 hotkey=str(hotkeys[uid]),
-                repo_id=parsed.repo_id if parsed else row.commitment,
-                revision=parsed.revision if parsed else "",
+                repo_id=commit.hf_repo_id if commit else row.commitment,
+                revision=commit.hf_revision if commit else "",
                 block=int(row.block),
             )
-            if parsed is None:
+            if commit is None:
+                # parse_chain_commit rejects anything without all of repo, revision and hash.
                 result.reason = "commitment_unparseable"
-            elif parsed.revision.strip().lower() == UNPINNED_REVISION:
+            elif str(commit.hf_revision).strip().lower() == UNPINNED_REVISION:
                 result.reason = "revision_is_main"
             else:
-                result.reason = self._chain_check(result, chain)
+                result.reason = f"pending:{commit.model_hash}"
             if uid not in by_uid or result.block < by_uid[uid].block:
                 by_uid[uid] = result
         return [by_uid[uid] for uid in sorted(by_uid)]
-
-    @staticmethod
-    def _chain_check(result: ModelEvalResult, chain: dict[str, str]) -> str:
-        raw = chain.get(result.hotkey)
-        if not raw:
-            return "chain_commitment_missing"
-        commit = parse_chain_commit(raw)
-        if commit is None:
-            return "chain_commitment_unparseable"
-        if commit.hf_repo_id != result.repo_id or commit.hf_revision != result.revision:
-            return "chain_commitment_changed"
-        return f"pending:{commit.model_hash}"
 
     # ---- download + hash --------------------------------------------------
 
@@ -754,6 +757,23 @@ class ModelEvaluator:
             logger.info(
                 f"  miner_uid={result.uid} repo_id={result.repo_id} "
                 f"revision={result.revision[:5]} block={result.block}"
+            )
+
+        if not pending:
+            logger.info(f"No verifiable model commitments among {len(results)} submission(s); no model winner")
+            return ModelEvaluationOutcome(
+                date=date,
+                block=int(block),
+                winner_uid=None,
+                baseline=None,
+                results=results,
+                imagenet_samples=0,
+                adv_rows=0,
+                adv_images=0,
+                adv_dataset_revision="",
+                group_epsilon=cfg.group_epsilon,
+                duration_seconds=time.time() - started,
+                imagenet_floor=cfg.imagenet_floor,
             )
 
         logger.info("Preparing evaluation data")
