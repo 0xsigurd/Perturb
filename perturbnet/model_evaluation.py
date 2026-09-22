@@ -26,7 +26,6 @@ from perturbnet.model_commit import (
     MODEL_HASH_CHARS,
     NUM_CLASSES,
     parse_chain_commit,
-    parse_repo_at_revision,
     sha256_model_and_hotkey,
 )
 
@@ -681,13 +680,11 @@ class ModelEvaluator:
         reference_model: torch.nn.Module,
         device: torch.device,
         fetch_api_commitments: Callable[[], list[ApiCommitment]],
-        fetch_chain_commitments: Callable[[], dict[str, str]],
     ) -> None:
         self.config = config
         self.reference_model = reference_model
         self.device = device
         self.fetch_api_commitments = fetch_api_commitments
-        self.fetch_chain_commitments = fetch_chain_commitments
 
     # ---- candidates -------------------------------------------------------
 
@@ -697,7 +694,6 @@ class ModelEvaluator:
             # An empty snapshot is an upstream problem, not "every miner failed": treat it as
             # missing data so the caller keeps the previous winner instead of clearing it.
             raise EvaluationDataUnavailable(f"{self.config.commitments_api_url} returned no commitments")
-        chain = self.fetch_chain_commitments()
         uid_by_hotkey = {str(hotkey): uid for uid, hotkey in enumerate(hotkeys)}
         by_uid: dict[int, ModelEvalResult] = {}
         for row in api_rows:
@@ -705,35 +701,24 @@ class ModelEvaluator:
             if uid is None or not (0 <= uid < len(hotkeys)):
                 logger.debug(f"Commitment row skipped: miner_id={row.miner_id!r} is not a registered uid/hotkey")
                 continue
-            parsed = parse_repo_at_revision(row.commitment)
+            commit = parse_chain_commit(row.commitment)
             result = ModelEvalResult(
                 uid=uid,
                 hotkey=str(hotkeys[uid]),
-                repo_id=parsed.repo_id if parsed else row.commitment,
-                revision=parsed.revision if parsed else "",
+                repo_id=commit.hf_repo_id if commit else row.commitment,
+                revision=commit.hf_revision if commit else "",
                 block=int(row.block),
             )
-            if parsed is None:
+            if commit is None:
+                # parse_chain_commit rejects anything without all of repo, revision and hash.
                 result.reason = "commitment_unparseable"
-            elif parsed.revision.strip().lower() == UNPINNED_REVISION:
+            elif str(commit.hf_revision).strip().lower() == UNPINNED_REVISION:
                 result.reason = "revision_is_main"
             else:
-                result.reason = self._chain_check(result, chain)
+                result.reason = f"pending:{commit.model_hash}"
             if uid not in by_uid or result.block < by_uid[uid].block:
                 by_uid[uid] = result
         return [by_uid[uid] for uid in sorted(by_uid)]
-
-    @staticmethod
-    def _chain_check(result: ModelEvalResult, chain: dict[str, str]) -> str:
-        raw = chain.get(result.hotkey)
-        if not raw:
-            return "chain_commitment_missing"
-        commit = parse_chain_commit(raw)
-        if commit is None:
-            return "chain_commitment_unparseable"
-        if commit.hf_repo_id != result.repo_id or commit.hf_revision != result.revision:
-            return "chain_commitment_changed"
-        return f"pending:{commit.model_hash}"
 
     # ---- download + hash --------------------------------------------------
 

@@ -778,7 +778,6 @@ class PerturbValidator:
             reference_model=self.model,
             device=self.device,
             fetch_api_commitments=lambda: get_previous_commitments(url=commitments_url, timeout_seconds=timeout_seconds),
-            fetch_chain_commitments=lambda: self.subtensor.get_all_commitments(netuid),
         )
 
     def run_model_evaluation(self) -> ModelEvaluationOutcome | None:
