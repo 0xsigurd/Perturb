@@ -319,8 +319,11 @@ class EvalData:
         return sum(len(row.adversarial) for row in self.adversarial)
 
 
-def day_seed(date: str) -> int:
-    return int(hashlib.sha256(date.encode("utf-8")).hexdigest()[:8], 16)
+def eval_seed(date: str, revision: str) -> int:
+    # Mixing in the pinned dataset commit keeps the draw identical for every validator
+    # while making it uncomputable before the dataset closes at 00:00 UTC, so miners
+    # cannot train on a future day's evaluation images.
+    return int(hashlib.sha256(f"{date}:{revision}".encode("utf-8")).hexdigest()[:8], 16)
 
 
 def _decode(image_bytes: bytes) -> PILImage.Image:
@@ -547,7 +550,6 @@ def load_eval_data(
     batch_size: int,
     token: str | None,
 ) -> EvalData:
-    seed = day_seed(date)
     started = time.time()
     day_start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     window_start = day_start - timedelta(days=1)
@@ -562,6 +564,7 @@ def load_eval_data(
         raise EvaluationDataUnavailable(
             f"adversarial dataset {adv_repo_id} has no commit before {day_start:%Y-%m-%dT%H:%MZ}"
         )
+    seed = eval_seed(date, adv_revision)
 
     # Rows are copied into memory, so the datasets cache for the pinned revision is
     # disposable: keep it in a temp dir that is removed here instead of growing
