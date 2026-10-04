@@ -30,7 +30,7 @@ from perturbnet.api_client import (
     post_model_evaluation,
 )
 from perturbnet.duplicate_responses import zero_duplicate_responses
-from perturbnet.emissions import blend_track_weights, ranked_emission_shares
+from perturbnet.emissions import blend_track_weights, ranked_emission_shares, stake_weighted_ranks
 from perturbnet.epoch_timing import epoch_countdown
 from perturbnet.image_io import (
     changed_pixel_count,
@@ -706,15 +706,13 @@ class PerturbValidator:
             if is_validator_neuron(self.metagraph, uid)
         ]
 
-    def _fetch_consensus_avg_scores(self) -> dict[int, float]:
-        """Stake-weighted average of each miner's avg_score across all validators' reports."""
+    def _fetch_leaderboard_reports(self) -> list[tuple[float, dict[int, float]]]:
+        """(stake, uid -> avg_score) for every validator whose leaderboard report is available."""
         base_url = str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL))
         timeout_seconds = float(
             getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)
         )
-        totals: dict[int, float] = {}
-        stake_totals: dict[int, float] = {}
-        reporting_validators = 0
+        reports: list[tuple[float, dict[int, float]]] = []
         for hotkey, stake in self._validators_with_stake():
             if stake <= 0.0:
                 continue
@@ -727,18 +725,9 @@ class PerturbValidator:
             except Exception as exc:
                 logger.debug(f"Leaderboard scores unavailable validator={hotkey}: {exc}")
                 continue
-            if not scores:
-                continue
-            reporting_validators += 1
-            for uid, avg_score in scores.items():
-                totals[uid] = totals.get(uid, 0.0) + avg_score * stake
-                stake_totals[uid] = stake_totals.get(uid, 0.0) + stake
-        consensus = {uid: totals[uid] / stake_totals[uid] for uid in totals if stake_totals[uid] > 0.0}
-        logger.info(
-            f"Consensus avg scores gathered validators={reporting_validators} miners={len(consensus)} "
-            "(stake-weighted)"
-        )
-        return consensus
+            if scores:
+                reports.append((stake, scores))
+        return reports
 
     # ------------------------------------------------------------------ model track
 
@@ -874,35 +863,38 @@ class PerturbValidator:
             logger.warning(f"Configured burn_uid={burn_uid} is outside metagraph; falling back to UID 0.")
             burn_uid = 0
 
-        # Weights come exclusively from the network-wide consensus: each
-        # miner's avg_score is averaged across every reporting validator's
-        # leaderboard. History gating lives upstream in the leaderboard
-        # payload (short-history miners report avg_score=0), so no local
-        # history checks are needed here.
-        consensus_scores = self._fetch_consensus_avg_scores()
+        # Weights come exclusively from the network-wide consensus: every
+        # reporting validator ranks miners by its leaderboard avg_score, and
+        # miners are ordered by the stake-weighted mean of those ranks. History
+        # gating lives upstream in the leaderboard payload (short-history miners
+        # report avg_score=0), so no local history checks are needed here.
+        n_uids = int(self.metagraph.n)
+        reports = [
+            (stake, {uid: score for uid, score in scores.items() if uid != burn_uid and 0 <= uid < n_uids})
+            for stake, scores in self._fetch_leaderboard_reports()
+        ]
         model_winner = self._model_winner_for_weights(burn_uid=burn_uid)
-        if not consensus_scores and model_winner is None:
+        if not reports and model_winner is None:
             logger.warning("No consensus scores available from leaderboard API and no model winner; skipping weight setting.")
             return False
 
-        eligible = [
-            (uid, float(score))
-            for uid, score in consensus_scores.items()
-            if uid != burn_uid and 0 <= uid < int(self.metagraph.n)
-        ]
-        if not eligible and model_winner is None:
+        n_eligible = len({uid for _, scores in reports for uid in scores})
+        if not n_eligible and model_winner is None:
             logger.warning("Consensus contains no scorable miners; skipping weight setting.")
             return False
 
+        consensus_ranks = stake_weighted_ranks(reports)
+        logger.info(
+            f"Consensus ranks gathered validators={len(reports)} ranked_miners={len(consensus_ranks)} "
+            "(stake-weighted)"
+        )
         burn_rate = self._fetch_burn_rate()
-        eligible.sort(key=lambda x: (x[1], -x[0]), reverse=True)
-        n_eligible = len(eligible)
-        emission_raw = np.zeros(int(self.metagraph.n), dtype=np.float32)
+        ranked = sorted(consensus_ranks.items(), key=lambda item: (item[1], item[0]))
+        ranked_uids = [uid for uid, _ in ranked]
+        emission_raw = np.zeros(n_uids, dtype=np.float32)
 
-        positive_eligible = [(uid, avg_score) for uid, avg_score in eligible if avg_score > 0.0]
-        positive_uids = [uid for uid, _ in positive_eligible]
         track_weights = blend_track_weights(
-            scanning_shares=ranked_emission_shares(positive_uids),
+            scanning_shares=ranked_emission_shares(ranked_uids),
             model_winner_uid=model_winner,
             scanning_share=float(getattr(self.config.perturb, "scanning_emission_share", C.SCANNING_EMISSION_SHARE)),
             model_share=float(getattr(self.config.perturb, "model_emission_share", C.MODEL_EMISSION_SHARE)),
@@ -928,20 +920,19 @@ class PerturbValidator:
                 logger.error(f"set_weights failed (all zero): {_set_weights_failure(msg)}")
             return bool(ok)
 
-        for uid, share in ranked_emission_shares(positive_uids).items():
+        for uid, share in ranked_emission_shares(ranked_uids).items():
             emission_raw[uid] = float(share)
 
-        normalized = np.zeros(int(self.metagraph.n), dtype=np.float32)
+        normalized = np.zeros(n_uids, dtype=np.float32)
         for uid, weight in track_weights.items():
             normalized[uid] = float(weight)
-        for rank0, (uid, avg_score) in enumerate(eligible[:10]):
-            rank = rank0 + 1
+        for position, (uid, consensus_rank) in enumerate(ranked[:10], start=1):
             logger.debug(
-                f"rank={rank} uid={uid} avg_score={avg_score:.6f} scanning_share={emission_raw[uid]:.6f} weight={normalized[uid]:.6f}"
+                f"rank={position} uid={uid} consensus_rank={consensus_rank:.3f} scanning_share={emission_raw[uid]:.6f} weight={normalized[uid]:.6f}"
             )
         top_weight_items: list[str] = []
-        for rank, (uid, avg_score) in enumerate(positive_eligible[:5], start=1):
-            top_weight_items.append(f"r{rank}:uid{uid}:avg={avg_score:.4f}:w={normalized[uid]:.4f}")
+        for position, (uid, consensus_rank) in enumerate(ranked[:5], start=1):
+            top_weight_items.append(f"r{position}:uid{uid}:rank={consensus_rank:.2f}:w={normalized[uid]:.4f}")
         self._log_summary(
             "weights_summary",
             burn=f"{burn_rate:.4f}",
