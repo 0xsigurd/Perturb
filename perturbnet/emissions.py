@@ -1,9 +1,44 @@
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Mapping, Sequence
 
 SCANNING_RANK_SHARES = (0.75, 0.20, 0.05)
 MAX_RANKED_MINER = len(SCANNING_RANK_SHARES)
+
+
+def fractional_ranks(scores: Mapping[int, float]) -> dict[int, float]:
+    """Rank 1 is the highest score; tied scores share the mean of the positions they span."""
+    ordered = sorted(scores, key=lambda uid: -scores[uid])
+    ranks: dict[int, float] = {}
+    start = 0
+    while start < len(ordered):
+        end = start
+        while end + 1 < len(ordered) and scores[ordered[end + 1]] == scores[ordered[start]]:
+            end += 1
+        for uid in ordered[start : end + 1]:
+            ranks[uid] = (start + end) / 2 + 1
+        start = end + 1
+    return ranks
+
+
+def stake_weighted_ranks(reports: Sequence[tuple[float, Mapping[int, float]]]) -> dict[int, float]:
+    """uid -> stake-weighted mean of the rank each validator gives it by score (1 = best).
+
+    Only miners with a positive score on at least one validator are ranked. A validator
+    with no positive score for one of them ranks it tied last, so every miner is averaged
+    over the same validators and the same total stake.
+    """
+    weighted = [(float(stake), scores) for stake, scores in reports if float(stake) > 0.0]
+    uids = {uid for _, scores in weighted for uid, score in scores.items() if float(score) > 0.0}
+    total_stake = sum(stake for stake, _ in weighted)
+    if not uids or total_stake <= 0.0:
+        return {}
+    totals = dict.fromkeys(uids, 0.0)
+    for stake, scores in weighted:
+        ranks = fractional_ranks({uid: max(0.0, float(scores.get(uid, 0.0))) for uid in uids})
+        for uid, rank in ranks.items():
+            totals[uid] += stake * rank
+    return {uid: total / total_stake for uid, total in totals.items()}
 
 
 def ranked_emission_shares(ranked_uids: Sequence[int]) -> dict[int, float]:
